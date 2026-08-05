@@ -29,9 +29,16 @@ type Result = {
   unitChecks?: Record<string, string>;
 };
 type ScanLog = { id: string; sequence: number; level: string; stage: string; event: string; message: string; context: Json; createdAt: string };
+type SourceCoverageItem = {
+  sourceId: string; name: string; url: string; status: "pending" | "running" | "completed" | "failed";
+  discovered: number; fetched: number; succeeded: number; error?: string;
+};
 type DiagnosticCheck = { ok: boolean; label: string; message: string; latencyMs?: number; fix?: string };
 type ModelDiagnostic = { ok: boolean; status: string; headline: string; recommendedAction?: string; modelId?: string; latencyMs?: number; checks?: Record<string, DiagnosticCheck> };
 type ExportDownload = { name: string; url: string };
+type ExportTarget =
+  | { mode: "native"; token: string; path: string; name: string }
+  | { mode: "browser"; handle: LocalDirectoryHandle; path: string; name: string };
 type SkillChange = { path: string; proposedValueJson: string; reason: string; expectedEffect: string; rollbackCondition: string };
 type SkillIteration = {
   id: string; scanId: string; version: number; status: string; createdAt: string; reviewedAt?: string | null;
@@ -63,14 +70,33 @@ const nav: { id: View; label: string; icon: string; group?: string }[] = [
   { id: "skills", label: "Skill 策略", icon: "✦" },
 ];
 
-async function api<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...(options?.headers ?? {}) },
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error ?? `请求失败：${response.status}`);
-  return data as T;
+type ApiOptions = RequestInit & { localRetry?: number };
+
+async function api<T>(path: string, options?: ApiOptions): Promise<T> {
+  const { localRetry, ...request } = options ?? {};
+  const method = String(request.method ?? "GET").toUpperCase();
+  const attempts = Math.max(1, localRetry ?? (method === "GET" ? 3 : 1));
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const response = await fetch(`${API}${path}`, {
+        ...request,
+        headers: { "Content-Type": "application/json", ...(request.headers ?? {}) },
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? `请求失败：${response.status}`);
+      return data as T;
+    } catch (cause) {
+      lastError = cause;
+      const localConnectionFailure = cause instanceof TypeError || /failed to fetch|networkerror/i.test(cause instanceof Error ? cause.message : String(cause));
+      if (!localConnectionFailure || attempt === attempts) {
+        if (localConnectionFailure) throw new Error("本地 API 服务暂时断开，守护进程正在自动恢复，请稍后重试");
+        throw cause;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 350 * attempt));
+    }
+  }
+  throw lastError;
 }
 
 function providerErrorMessage(cause: unknown) {
@@ -110,6 +136,7 @@ export default function Home() {
   const [results, setResults] = useState<Result[]>([]);
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
+  const [serviceState, setServiceState] = useState<"connecting" | "connected" | "reconnecting">("connecting");
 
   const refresh = useCallback(async () => {
     try {
@@ -120,8 +147,10 @@ export default function Home() {
       ]);
       setFields(f); setSources(s); setProviders(p); setSearchProviders(sp); setMcpServers(m);
       setScans(jobs); setDashboard(d);
+      setServiceState("connected"); setError("");
       if (!activeScanId && jobs[0]?.id) setActiveScanId(jobs[0].id);
     } catch (cause) {
+      setServiceState("reconnecting");
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   }, [activeScanId]);
@@ -145,6 +174,25 @@ export default function Home() {
     const timer = window.setInterval(() => void refresh(), 1800);
     return () => window.clearInterval(timer);
   }, [scans, refresh]);
+
+  useEffect(() => {
+    let wasDisconnected = false;
+    const check = async () => {
+      try {
+        const response = await fetch(`${API}/health`, { cache: "no-store", signal: AbortSignal.timeout(2_500) });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (wasDisconnected) void refresh();
+        wasDisconnected = false;
+        setServiceState("connected");
+      } catch {
+        wasDisconnected = true;
+        setServiceState("reconnecting");
+      }
+    };
+    void check();
+    const timer = window.setInterval(() => void check(), 5_000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
 
   function notify(message: string) {
     setToast(message);
@@ -172,9 +220,9 @@ export default function Home() {
             </div>
           ))}
         </nav>
-        <div className="sidebar-status">
+        <div className={`sidebar-status ${serviceState}`}>
           <span className="pulse" />
-          <div><strong>本地服务已连接</strong><small>数据仅保存在本机</small></div>
+          <div><strong>{serviceState === "connected" ? "本地服务已连接" : serviceState === "reconnecting" ? "服务自动恢复中" : "正在连接本地服务"}</strong><small>{serviceState === "connected" ? "数据仅保存在本机" : "无需重新配置模型或 API Key"}</small></div>
         </div>
       </aside>
 
@@ -308,7 +356,7 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
     setProviderId(id); setModelId(""); setModelOptions([]);
     if (!id) return;
     try {
-      const models = await api<{ id: string; name: string }[]>(`/api/providers/${id}/models`, { method: "POST", body: JSON.stringify({}) });
+      const models = await api<{ id: string; name: string }[]>(`/api/providers/${id}/models`, { method: "POST", body: JSON.stringify({}), localRetry: 3 });
       setModelOptions(models);
     } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
   }
@@ -453,11 +501,15 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
   const [logLevel, setLogLevel] = useState("all");
   const [logStage, setLogStage] = useState("all");
   const [selectedFailure, setSelectedFailure] = useState("");
+  const [repairingBilingual, setRepairingBilingual] = useState("");
   const filtered = results.filter((result) => filter === "all" || result.status === filter);
   const visibleLogs = logs.filter((log) => (logLevel === "all" || log.level === logLevel) && (logStage === "all" || log.stage === logStage));
   const failureReasons = (activeScan?.progress.failureReasons && typeof activeScan.progress.failureReasons === "object"
     ? activeScan.progress.failureReasons : {}) as Record<string, number>;
   const failureDetails = selectedFailure ? logs.filter((log) => failureLogMatches(log, selectedFailure)) : [];
+  const sourceCoverage = activeScan?.progress.sourceCoverage && typeof activeScan.progress.sourceCoverage === "object"
+    ? activeScan.progress.sourceCoverage as Record<string, unknown> : undefined;
+  const sourceCoverageItems = Array.isArray(sourceCoverage?.sources) ? sourceCoverage.sources as SourceCoverageItem[] : [];
   const serverRecall = activeScan?.progress.recall && typeof activeScan.progress.recall === "object"
     ? activeScan.progress.recall as Record<string, unknown> : undefined;
   const historicalBaseline = activeScan ? scans.filter((scan) => {
@@ -520,6 +572,15 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
     try { await api(`/api/results/${id}/deep-expand`, { method: "POST", body: JSON.stringify({ maxQueries: 12, maxPages: 20 }) }); notify("深度扩散已完成，结果已生成新修订"); await refresh(); }
     catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
   }
+  async function repairBilingual(id: string) {
+    setRepairingBilingual(id);
+    try {
+      await api(`/api/results/${id}/repair-bilingual`, { method: "POST", body: "{}" });
+      notify("中英双语字段与证据已重新提炼；请复核后确认结果");
+      await refresh();
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setRepairingBilingual(""); }
+  }
   return (
     <div className="stack">
       {recallRegression && <section className="recall-warning panel">
@@ -530,8 +591,12 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
       </section>}
       <section className="task-bar panel">
         <label><span>监测任务</span><select value={activeScanId} onChange={(e) => setActiveScanId(e.target.value)}><option value="">选择任务</option>{scans.map((scan) => <option key={scan.id} value={scan.id}>{scan.id.slice(0, 8)} · {statusLabel(scan.status)}</option>)}</select></label>
-        {activeScan && <><ProgressRing value={Number(activeScan.progress.percent ?? 0)} /><div className="task-summary"><strong>{statusLabel(activeScan.status)}</strong><span>{Number(activeScan.progress.pagesDiscovered ?? 0)} 个文章链接 · {Number(activeScan.progress.pagesFetched ?? 0)} 页已抓取 · {Number(activeScan.progress.withinRange ?? 0)} 篇在时间范围内 · {Number(activeScan.progress.results ?? 0)} 个项目</span><small>全文成功 {Number(activeScan.progress.fullTextSucceeded ?? 0)} · 动态渲染 {Number(activeScan.progress.dynamicPages ?? 0)} · MCP {Number(activeScan.progress.mcpCalls ?? 0)}/{Number(activeScan.progress.mcpFailures ?? 0)} · 日期不明/冲突 {Number(activeScan.progress.dateUnknown ?? 0)}/{Number(activeScan.progress.dateConflict ?? 0)} · 非项目/待复核 {Number(activeScan.progress.nonProjectArticles ?? 0)}/{Number(activeScan.progress.uncertainArticles ?? 0)} · 失败 {Number(activeScan.progress.failures ?? 0)}</small></div><div className="scan-controls">{activeScan.status === "running" && <button className="ghost small" onClick={() => void control("pause")}>Ⅱ 暂停</button>}{activeScan.status === "paused" && <button className="primary small" onClick={() => void control("resume")}>▶ 继续</button>}{["queued","running","paused"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void control("stop")}>■ 停止</button>}{["completed","failed","stopped"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void removeScan()}>⌫ 删除任务</button>}</div></>}
+        {activeScan && <><ProgressRing value={Number(activeScan.progress.percent ?? 0)} /><div className="task-summary"><strong>{statusLabel(activeScan.status)}</strong><span>{Number(activeScan.progress.pagesDiscovered ?? 0)} 个文章链接 · {Number(activeScan.progress.pagesFetched ?? 0)} 页已抓取 · {Number(activeScan.progress.withinRange ?? 0)} 篇在时间范围内 · {Number(activeScan.progress.results ?? 0)} 个项目</span><small>网站处理 {Number(sourceCoverage?.settled ?? activeScan.progress.sourcesScanned ?? 0)}/{Number(sourceCoverage?.total ?? activeScan.progress.sourcesTotal ?? 0)} · 成功 {Number(sourceCoverage?.succeeded ?? 0)} · 失败 {Number(sourceCoverage?.failed ?? 0)} · 全文成功 {Number(activeScan.progress.fullTextSucceeded ?? 0)} · 动态渲染 {Number(activeScan.progress.dynamicPages ?? 0)} · MCP {Number(activeScan.progress.mcpCalls ?? 0)}/{Number(activeScan.progress.mcpFailures ?? 0)} · 日期不明/冲突 {Number(activeScan.progress.dateUnknown ?? 0)}/{Number(activeScan.progress.dateConflict ?? 0)} · 非项目/待复核 {Number(activeScan.progress.nonProjectArticles ?? 0)}/{Number(activeScan.progress.uncertainArticles ?? 0)} · 失败事件 {Number(activeScan.progress.failures ?? 0)}</small></div><div className="scan-controls">{activeScan.status === "running" && <button className="ghost small" onClick={() => void control("pause")}>Ⅱ 暂停</button>}{activeScan.status === "paused" && <button className="primary small" onClick={() => void control("resume")}>▶ 继续</button>}{["queued","running","paused"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void control("stop")}>■ 停止</button>}{["completed","failed","stopped"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void removeScan()}>⌫ 删除任务</button>}</div></>}
       </section>
+      {sourceCoverage && <section className={`source-coverage panel ${Number(sourceCoverage.failed ?? 0) > 0 ? "has-failures" : ""}`}>
+        <div className="source-coverage-head"><div><strong>选定网站覆盖</strong><p>{Boolean(sourceCoverage.allSettled) ? `全部 ${Number(sourceCoverage.total ?? 0)} 个网站均已完成处理；失败网站不会被记作成功，但也不会阻断其他网站。` : `正在处理：已结算 ${Number(sourceCoverage.settled ?? 0)}/${Number(sourceCoverage.total ?? 0)} 个网站。任务只有在全部结算后才能完成。`}</p></div><div><span className="ok">成功 {Number(sourceCoverage.succeeded ?? 0)}</span><span className="bad">失败 {Number(sourceCoverage.failed ?? 0)}</span><span>运行中 {Number(sourceCoverage.running ?? 0)}</span><span>待处理 {Number(sourceCoverage.pending ?? 0)}</span></div></div>
+        <details><summary>查看全部网站状态与失败原因</summary><div className="source-coverage-list">{sourceCoverageItems.map((source) => <article className={source.status} key={source.sourceId}><span>{source.status === "completed" ? "✓" : source.status === "failed" ? "!" : source.status === "running" ? "↻" : "·"}</span><div><strong>{source.name}</strong><small>{source.url || source.sourceId}</small><p>发现 {source.discovered} · 抓取 {source.fetched} · 正文成功 {source.succeeded}{source.error ? ` · ${source.error}` : ""}</p></div></article>)}</div></details>
+      </section>}
       {(activeScan?.error || Object.keys(failureReasons).length > 0) && <section className="failure-summary panel"><div><span>!</span><strong>{activeScan?.status === "failed" ? "任务失败原因" : "已记录的失败分类"}</strong></div>{activeScan?.error && <p>{activeScan.error}</p>}<div className="failure-chips">{Object.entries(failureReasons).map(([reason, count]) => <button className={selectedFailure === reason ? "active" : ""} key={reason} onClick={() => setSelectedFailure(selectedFailure === reason ? "" : reason)}>{failureReasonLabel(reason)} · {count}</button>)}</div>{selectedFailure && <div className="failure-detail"><div className="failure-detail-head"><div><strong>{failureReasonLabel(selectedFailure)}明细</strong><p>显示可审计原始错误、来源和网址，可据此修订信息源或生成 Skill 迭代建议。</p></div><div><button className="ghost small" onClick={onOpenSources}>修改信息源</button><button className="primary small" onClick={onOpenSkill}>交给 Skill 优化</button></div></div>{failureDetails.length ? <div className="failure-detail-list">{failureDetails.map((log) => <details key={log.id}><summary><span>{log.context.source ? String(log.context.source) : log.stage}</span><strong>{log.message.split("\n")[0]}</strong><time>{new Date(log.createdAt).toLocaleString("zh-CN")}</time></summary><dl><div><dt>阶段/事件</dt><dd>{log.stage} / {log.event}</dd></div>{Boolean(log.context.url) && <div><dt>网址</dt><dd><a href={String(log.context.url)} target="_blank" rel="noreferrer">{String(log.context.url)}</a></dd></div>}{log.context.attempts != null && <div><dt>尝试次数</dt><dd>{String(log.context.attempts)}</dd></div>}{Boolean(log.context.method) && <div><dt>采集方式</dt><dd>{String(log.context.method)}</dd></div>}<div><dt>完整错误</dt><dd><pre>{log.message}</pre></dd></div></dl></details>)}</div> : <p className="muted">当前日志中没有与该分类逐条对应的记录；可在下方完整日志中继续筛选。</p>}</div>}</section>}
       {zeroResultInsight && <section className="zero-result-insight panel"><strong>为什么没有结果</strong><p>{zeroResultInsight}</p></section>}
       <section className="panel">
@@ -548,18 +613,19 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
             <article className={expanded === result.id ? "result-card expanded" : "result-card"} key={result.id}>
               <button className="result-main" onClick={() => setExpanded(expanded === result.id ? "" : result.id)}>
                 <span className={`score score-${Math.floor(result.score / 20)}`}>{Math.round(result.score)}</span>
-                <div className="result-title"><strong>{String(result.fields.project_name ?? "未命名项目")} {result.generatedFields?.includes("project_name") && <em className="generated-badge">系统提炼</em>}</strong><p>{String(result.fields.country ?? "")} · {capacityLabel(result.fields)} · 修订 {result.revision}</p></div>
+                <div className="result-title"><strong>{String(result.fields.project_name ?? "未命名项目")} {result.generatedFields?.includes("project_name") && <em className="generated-badge">系统提炼</em>}{isForeignResult(result) && <em className="bilingual-badge">中英双语 · {(result.sourceLanguage ?? "原文").toUpperCase()}</em>}</strong>{isForeignResult(result) && <small className="original-title" lang={result.sourceLanguage === "foreign" ? undefined : result.sourceLanguage}>原文：{result.originalFields?.project_name || "网页未提供独立项目名，中文名称由系统基于原文证据提炼"}</small>}<p>{String(result.fields.country ?? "")} · {capacityLabel(result.fields)} · 修订 {result.revision}</p></div>
                 <StatusPill status={result.status} />
                 <span className="chevron">{expanded === result.id ? "⌃" : "⌄"}</span>
               </button>
               {expanded === result.id && (
                 <div className="result-detail">
                   <div className="evidence-grid">
-                    <section><h3>字段与双语证据</h3>{fields.filter((field) => result.fields[field.id] !== "" && result.fields[field.id] != null).map((field) => <div className="evidence-row" key={field.id}><span>{field.label.replace("\n"," ")}</span><strong><b>{String(result.fields[field.id])}</b>{result.generatedFields?.includes(field.id) && <em className="generated-badge">提炼</em>}{bilingualOriginal(result, field.id) && <small lang={result.sourceLanguage === "foreign" ? undefined : result.sourceLanguage}>原文：{result.originalFields?.[field.id]}</small>}</strong><div className="bilingual-evidence"><p><i>原文证据</i><EvidenceText text={result.evidence[field.id] || "该字段暂无截取证据，建议人工查看原文。"} values={evidenceValues(result, field.id)} /></p>{result.evidenceTranslations?.[field.id] && result.evidenceTranslations[field.id] !== result.evidence[field.id] && <p className="translation"><i>中文验证</i>{result.evidenceTranslations[field.id]}</p>}{result.unitChecks?.[field.id] && <p className={result.unitChecks[field.id].startsWith("未通过") ? "unit-check bad" : "unit-check"}><i>单位核验</i>{result.unitChecks[field.id]}</p>}</div></div>)}</section>
+                    <section><h3>{isForeignResult(result) ? "字段双语对照与验证" : "字段与证据"}</h3>{fields.filter((field) => hasDisplayValue(result.fields[field.id]) || hasDisplayValue(result.originalFields?.[field.id])).map((field) => <div className="evidence-row" key={field.id}><span>{field.label.replace("\n"," ")}</span><strong>{isForeignResult(result) && <small className="language-label">中文提炼</small>}<b>{String(result.fields[field.id] ?? "待补齐")}</b>{result.generatedFields?.includes(field.id) && <em className="generated-badge">提炼</em>}{isForeignResult(result) ? <small lang={result.sourceLanguage === "foreign" ? undefined : result.sourceLanguage}>原文（{(result.sourceLanguage ?? "original").toUpperCase()}）：{result.originalFields?.[field.id] || "原文未单独给出"}</small> : bilingualOriginal(result, field.id) && <small>原文：{result.originalFields?.[field.id]}</small>}</strong><div className="bilingual-evidence"><p><i>原文证据</i><EvidenceText text={result.evidence[field.id] || "该字段暂无截取证据，建议人工查看原文。"} values={evidenceValues(result, field.id)} /></p>{isForeignResult(result) ? <p className={result.evidenceTranslations?.[field.id] ? "translation" : "translation missing"}><i>中文验证</i>{result.evidenceTranslations?.[field.id] || "翻译待自动补齐；当前结果应人工复核"}</p> : result.evidenceTranslations?.[field.id] && result.evidenceTranslations[field.id] !== result.evidence[field.id] && <p className="translation"><i>中文验证</i>{result.evidenceTranslations[field.id]}</p>}{result.unitChecks?.[field.id] && <p className={result.unitChecks[field.id].startsWith("未通过") ? "unit-check bad" : "unit-check"}><i>单位核验</i>{result.unitChecks[field.id]}</p>}</div></div>)}</section>
                     <section><h3>来源与判断</h3><a className="source-link" href={result.primaryUrl || undefined} target="_blank" rel="noreferrer">{result.primaryUrl || "尚未找到可靠主链接"}</a><p className="muted">候选页面：{result.candidateUrls.length} 个</p>{result.conflicts.length > 0 && <div className="conflict-box"><strong>需要注意</strong>{result.conflicts.map((item) => <p key={item}>• {item}</p>)}</div>}</section>
                   </div>
                   <div className="result-actions">
                     <button className="ghost" onClick={() => void deep(result.id)}>⌕ 二次深度扩散</button>
+                    {isForeignResult(result) && <button className="ghost" disabled={repairingBilingual === result.id} onClick={() => void repairBilingual(result.id)}>{repairingBilingual === result.id ? "正在补齐双语…" : "中/EN 自动补齐双语"}</button>}
                     <button className="danger-ghost" onClick={() => void decide(result.id, "rejected")}>驳回</button>
                     <button className="primary" onClick={() => void decide(result.id, "approved")}>确认结果</button>
                   </div>
@@ -671,7 +737,7 @@ function ModelsView({ providers, refresh, notify, onError }: { providers: Provid
     if (!id) return;
     setLoading(true); setTest(null); setCatalogError("");
     try {
-      const available = await api<{ id: string; name: string; capabilities?: Json }[]>(`/api/providers/${id}/models`, { method: "POST", body: JSON.stringify({ force: true }) });
+      const available = await api<{ id: string; name: string; capabilities?: Json }[]>(`/api/providers/${id}/models`, { method: "POST", body: JSON.stringify({ force: true }), localRetry: 3 });
       setModels(available);
       setHistory(await api<{ id: string; ok: boolean; createdAt: string }[]>(`/api/providers/${id}/diagnostics`));
       notify(`模型目录已刷新，共 ${available.length} 个模型`);
@@ -943,30 +1009,39 @@ function SkillView({ scans, activeScanId, notify, onError }: {
 function ExportsView({ activeScan, results, fields, notify, onError }: { activeScan?: Scan; results: Result[]; fields: Field[]; notify: (message: string) => void; onError: (message: string) => void }) {
   const [includeFlagged, setIncludeFlagged] = useState(false);
   const [exported, setExported] = useState<{ location: string; files: string[]; verified: boolean } | null>(null);
-  const [targetDirectory, setTargetDirectory] = useState<LocalDirectoryHandle | null>(null);
+  const [targetDirectory, setTargetDirectory] = useState<ExportTarget | null>(null);
   const unresolved = results.filter((result) => !["approved","auto_approved"].includes(result.status)).length;
   async function chooseDirectory() {
     try {
-      const browserWindow = window as unknown as { showDirectoryPicker?: (options?: { mode: "readwrite" }) => Promise<LocalDirectoryHandle> };
-      const picker = browserWindow.showDirectoryPicker?.bind(window);
-      if (!picker) throw new Error("当前浏览器不支持文件夹选择；仍可导出到应用默认目录");
-      const handle = await picker({ mode: "readwrite" });
-      if (handle.requestPermission && await handle.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("没有获得目标文件夹的写入权限");
-      setTargetDirectory(handle);
+      try {
+        const selected = await api<{ cancelled: boolean; token?: string; path?: string; name?: string }>("/api/export-directories/pick", { method: "POST", body: "{}" });
+        if (selected.cancelled) return;
+        if (!selected.token || !selected.path || !selected.name) throw new Error("服务端未返回有效的文件夹授权");
+        setTargetDirectory({ mode: "native", token: selected.token, path: selected.path, name: selected.name });
+        return;
+      } catch (nativeCause) {
+        const browserWindow = window as unknown as { showDirectoryPicker?: (options?: { mode: "readwrite" }) => Promise<LocalDirectoryHandle> };
+        const picker = browserWindow.showDirectoryPicker?.bind(window);
+        if (!picker) throw nativeCause;
+        const handle = await picker({ mode: "readwrite" });
+        if (handle.requestPermission && await handle.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("没有获得目标文件夹的写入权限");
+        setTargetDirectory({ mode: "browser", handle, path: handle.name, name: handle.name });
+      }
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === "AbortError") return;
       onError(cause instanceof Error ? cause.message : String(cause));
     }
   }
   async function copyToTarget(downloads: Record<string, ExportDownload>) {
-    if (!targetDirectory) return [];
-    if (targetDirectory.requestPermission && await targetDirectory.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("目标文件夹写入权限已失效，请重新选择");
+    if (!targetDirectory || targetDirectory.mode !== "browser") return [];
+    const handle = targetDirectory.handle;
+    if (handle.requestPermission && await handle.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("目标文件夹写入权限已失效，请重新选择");
     const verified: string[] = [];
     for (const descriptor of Object.values(downloads)) {
       const response = await fetch(`${API}${descriptor.url}`);
       if (!response.ok) throw new Error(`无法下载导出文件：${descriptor.name}`);
       const blob = await response.blob();
-      const fileHandle = await targetDirectory.getFileHandle(descriptor.name, { create: true });
+      const fileHandle = await handle.getFileHandle(descriptor.name, { create: true });
       const writable = await fileHandle.createWritable();
       await writable.write(blob);
       await writable.close();
@@ -980,11 +1055,17 @@ function ExportsView({ activeScan, results, fields, notify, onError }: { activeS
     if (!activeScan) return;
     try {
       const snapshot = await api<{ id: string }>("/api/snapshots", { method: "POST", body: JSON.stringify({ scanId: activeScan.id, resultIds: results.map((result) => result.id), fieldIds: fields.map((field) => field.id), includeFlagged }) });
-      const output = await api<{ id: string; outputDir: string; files: Record<string,string>; downloads: Record<string,ExportDownload> }>(`/api/snapshots/${snapshot.id}/export`, { method: "POST", body: "{}" });
-      if (targetDirectory) {
+      const output = await api<{ id: string; outputDir: string; files: Record<string,string>; downloads: Record<string,ExportDownload>; delivery: "direct" | "staging"; verification: Record<string,{ path: string; exists: boolean; size: number }> }>(`/api/snapshots/${snapshot.id}/export`, { method: "POST", body: JSON.stringify({ directoryToken: targetDirectory?.mode === "native" ? targetDirectory.token : "" }) });
+      if (targetDirectory?.mode === "native") {
+        const checks = Object.values(output.verification);
+        if (output.delivery !== "direct" || checks.length !== 4 || checks.some((item) => !item.exists || item.size <= 0)) throw new Error("服务端未能在目标文件夹完成四个文件的落盘校验");
+        const files = checks.map((item) => item.path);
+        setExported({ location: output.outputDir, files, verified: true });
+        notify(`四个文件已直接写入并校验：${output.outputDir}`);
+      } else if (targetDirectory?.mode === "browser") {
         const files = await copyToTarget(output.downloads);
         await api(`/api/exports/${output.id}/staging`, { method: "DELETE" });
-        setExported({ location: `所选文件夹：${targetDirectory.name}`, files, verified: true });
+        setExported({ location: `所选文件夹：${targetDirectory.path}`, files, verified: true });
         notify(`已校验 ${files.length} 个文件，并保存到“${targetDirectory.name}”`);
       } else {
         setExported({ location: output.outputDir, files: Object.values(output.files), verified: true });
@@ -997,7 +1078,7 @@ function ExportsView({ activeScan, results, fields, notify, onError }: { activeS
       <section className="panel export-summary">
         <p className="eyebrow">确认快照</p><h2>{activeScan ? `任务 ${activeScan.id.slice(0,8)}` : "尚未选择任务"}</h2>
         <div className="export-metrics"><div><strong>{results.length}</strong><span>全部结果</span></div><div><strong>{results.length-unresolved}</strong><span>已确认</span></div><div><strong>{unresolved}</strong><span>待处理</span></div></div>
-        <div className="export-target"><div><strong>导出目标文件夹</strong><p>{targetDirectory ? targetDirectory.name : "未选择，将使用应用默认 outputs 目录"}</p></div><button className="ghost small" onClick={() => void chooseDirectory()}>{targetDirectory ? "重新选择" : "选择文件夹"}</button></div>
+        <div className="export-target"><div><strong>导出目标文件夹</strong><p>{targetDirectory ? targetDirectory.path : "未选择，将使用应用默认 outputs 目录"}</p></div><button className="ghost small" onClick={() => void chooseDirectory()}>{targetDirectory ? "重新选择" : "选择文件夹"}</button></div>
         {unresolved > 0 && <label className="include-flagged"><input type="checkbox" checked={includeFlagged} onChange={(e) => setIncludeFlagged(e.target.checked)} /><div><strong>将存疑记录一并导出</strong><p>这些记录会保留状态、评分和冲突说明。</p></div></label>}
         <button className="primary full export-button" disabled={!activeScan || !results.length || (unresolved > 0 && !includeFlagged)} onClick={() => void create()}>确认快照并一键导出</button>
       </section>
@@ -1059,12 +1140,15 @@ function bilingualOriginal(result: Result, fieldId: string) {
   const translated = String(result.fields[fieldId] ?? "").trim();
   return Boolean(original && original.toLocaleLowerCase() !== translated.toLocaleLowerCase());
 }
+function isForeignResult(result: Result) { return Boolean(result.sourceLanguage && !/^zh(?:-|$)/i.test(result.sourceLanguage)); }
+function hasDisplayValue(value: unknown) { return value !== "" && value !== null && value !== undefined; }
 function failureReasonLabel(code: string) {
   const labels: Record<string, string> = {
     DISCOVERY_ERROR: "站点枚举失败", ROBOTS_DENIED: "robots.txt 禁止", HTTP_401: "需要登录", HTTP_403: "访问被拒绝",
     HTTP_404: "页面不存在", HTTP_429: "访问频率受限", TIMEOUT: "请求超时", NETWORK: "网络或 DNS 异常",
     PROXY_OR_DNS: "代理或 Fake-IP 路由异常", ACCESS_DENIED: "访问被拒绝", BOT_CHALLENGE: "机器人验证页面",
     RATE_LIMITED: "远端站点限流", FETCH_ERROR: "网页抓取异常", MODEL_EXTRACTION_ERROR: "模型抽取失败", MCP_CALL_ERROR: "MCP 调用失败",
+    SOURCE_MISSING: "选定信息源已删除", SOURCE_NO_CONTENT: "网站未取得可用正文", SOURCE_SCAN_ERROR: "单站扫描异常",
   };
   return labels[code] ?? code;
 }
@@ -1095,6 +1179,9 @@ function failureLogMatches(log: ScanLog, code: string) {
   if (code === "SEARCH_FALLBACK_ERROR") return log.event === "search_fallback_failed";
   if (code === "MODEL_EXTRACTION_ERROR") return log.stage === "model" && log.level === "error";
   if (code === "MCP_CALL_ERROR") return log.stage === "mcp" && log.level === "error";
+  if (code === "SOURCE_MISSING") return log.event === "source_missing";
+  if (code === "SOURCE_NO_CONTENT") return log.event === "source_no_content";
+  if (code === "SOURCE_SCAN_ERROR") return log.event === "source_scan_failed";
   const patterns: Record<string, RegExp> = {
     TIMEOUT: /TIMEOUT|timeout|超时/i, NETWORK: /NETWORK|fetch failed|socket|网络|DNS/i,
     PROXY_OR_DNS: /PROXY_OR_DNS|Fake-IP|代理|DNS/i, ACCESS_DENIED: /ACCESS_DENIED|access denied|访问被拒绝/i,

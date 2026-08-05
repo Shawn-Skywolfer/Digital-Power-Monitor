@@ -11,18 +11,20 @@ import type {
 } from "./types";
 import { listProviderModels, searchWeb, testProvider } from "./providers";
 import {
-  dateStatusFor, discoverSourcePages, fetchDocument, normalizeUrl,
+  dateStatusFor, discoverSourcePages, documentContentQuality, fetchDocument, normalizeUrl, rankDiscoveredUrls,
 } from "./crawler";
-import { assessArticle, mapProject, saveAssessment } from "./projects";
+import { applyBilingualRepair, assessArticle, mapProject, saveAssessment } from "./projects";
 import {
   ScanStoppedError, controlScan, getScanLogs, logScan, markScanActive, scanControlPoint,
 } from "./scan-runtime";
 import { catalogMcpServer, diagnoseMcpError, handleMcpRequest, invokeMcpServersParallel, mapMcpRow, type McpActions } from "./mcp";
 import { exportSnapshot } from "./exporter";
+import { pickExportDirectory, resolveExportDirectory } from "./export-directory";
 import retrievalPolicy from "../skills/scan-overseas-energy-projects/references/retrieval-policy.json";
 import { getRetrievalSkill, proposeRetrievalSkillIteration, reviewRetrievalSkillIteration } from "./skills";
 import { firecrawlKeyFromProfiles, mapWithFirecrawl, scrapeWithFirecrawl } from "./firecrawl";
 import { chooseRecallBaseline, recallComparison, type ComparableScan } from "./recall";
+import { runAllSourceJobs } from "./source-scheduler";
 
 const HOST = process.env.DPM_API_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.DPM_API_PORT ?? 8765);
@@ -33,6 +35,18 @@ const MCP_TOKEN = fs.readFileSync(MCP_TOKEN_PATH, "utf8").trim();
 
 const DEFAULT_BUDGET: ScanBudget = {
   maxPages: 100, maxSearches: 30, maxMinutes: 10, maxConcurrency: 3, maxCostUsd: 2,
+};
+type SourceCoverageState = {
+  sourceId: string;
+  name: string;
+  url: string;
+  status: "pending" | "running" | "completed" | "failed";
+  discovered: number;
+  fetched: number;
+  succeeded: number;
+  error?: string;
+  startedAt?: string;
+  completedAt?: string;
 };
 const RETRIEVAL_POLICY_PATH = path.resolve("skills", "scan-overseas-energy-projects", "references", "retrieval-policy.json");
 function currentRetrievalPolicy() {
@@ -99,6 +113,23 @@ function getScan(id: string) {
     id: String(row.id), request: jsonParse<ScanRequest>(row.request_json, {} as ScanRequest),
     status: String(row.status), progress: jsonParse<JsonObject>(row.progress_json, {}),
     error: row.error ? String(row.error) : null, createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+  };
+}
+
+function storedDocument(row: Record<string, unknown>): CrawledDocument {
+  return {
+    id: String(row.id), url: String(row.url), canonicalUrl: String(row.canonical_url), title: String(row.title ?? ""),
+    publishedAt: row.published_at ? String(row.published_at) : null, fetchedAt: String(row.fetched_at),
+    contentType: String(row.content_type ?? "text/html"), statusCode: Number(row.status_code ?? 200), hash: String(row.hash),
+    text: String(row.text ?? ""), markdown: String(row.markdown ?? ""), rawPath: String(row.raw_path ?? ""),
+    markdownPath: String(row.markdown_path ?? ""), sourceId: String(row.source_id ?? ""),
+    dateCandidates: jsonParse<string[]>(row.date_candidates_json, []),
+    dateStatus: String(row.date_status ?? "date_unknown") as CrawledDocument["dateStatus"],
+    dateEvidence: String(row.date_evidence ?? ""), fetchMode: String(row.fetch_mode ?? "static") as CrawledDocument["fetchMode"],
+    rendered: Boolean(row.rendered), discoveryMethod: String(row.discovery_method ?? "source") as CrawledDocument["discoveryMethod"],
+    warnings: jsonParse<string[]>(row.warnings_json, []), pageType: String(row.page_type ?? "article") as CrawledDocument["pageType"],
+    extractionMethod: String(row.extraction_method ?? "archive"), attemptCount: Number(row.attempt_count ?? 1),
+    failureCode: row.failure_code ? String(row.failure_code) : undefined, error: row.error ? String(row.error) : undefined,
   };
 }
 
@@ -328,7 +359,7 @@ function normalizeScanRequest(payload: JsonObject): ScanRequest {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate) || startDate > endDate) {
     throw new Error("日期范围无效");
   }
-  const sourceIds = Array.isArray(payload.sourceIds) ? payload.sourceIds.map(String) : [];
+  const sourceIds = Array.isArray(payload.sourceIds) ? [...new Set(payload.sourceIds.map(String))] : [];
   const natural = (name: string, value: unknown, minimum: number, maximum: number) => {
     const number = Number(value);
     if (!Number.isInteger(number) || number < minimum || number > maximum) {
@@ -363,14 +394,30 @@ function normalizeScanRequest(payload: JsonObject): ScanRequest {
 
 async function runScan(scanId: string, request: ScanRequest) {
   const fields = listFields();
-  const sources = listSources().filter((source) => request.sourceIds.includes(source.id) && source.enabled);
+  const sourceCatalog = new Map(listSources().map((source) => [source.id, source]));
+  const sources = request.sourceIds.map((id) => sourceCatalog.get(id)).filter((source): source is SourceRecord => Boolean(source));
+  const sourceCoverageStates: SourceCoverageState[] = request.sourceIds.map((sourceId) => {
+    const source = sourceCatalog.get(sourceId);
+    return {
+      sourceId,
+      name: source?.name ?? `已删除的信息源（${sourceId.slice(0, 8)}）`,
+      url: source?.url ?? "",
+      status: source ? "pending" : "failed",
+      discovered: 0,
+      fetched: 0,
+      succeeded: 0,
+      error: source ? undefined : "任务开始前该信息源已被删除，无法扫描",
+      completedAt: source ? undefined : now(),
+    };
+  });
   const provider = getProvider(request.providerId);
   const searchProviders = (request.searchProviderIds ?? []).map(getSearchProvider).filter(Boolean) as SearchProviderRecord[];
   const documents = new Map<string, CrawledDocument>();
   const fetchedUrls = new Set<string>();
   let discovered = 0;
   let fetched = 0;
-  let failures = 0;
+  let failures = sourceCoverageStates.filter((state) => state.status === "failed").length;
+  let completedSources = failures;
   let modelExtractions = 0;
   let searches = 0;
   let fullTextSucceeded = 0;
@@ -392,6 +439,22 @@ async function runScan(scanId: string, request: ScanRequest) {
   const discoveryStrategies = new Set<string>();
   const failureReasons: Record<string, number> = {};
   const addFailure = (code: string) => { failureReasons[code] = (failureReasons[code] ?? 0) + 1; };
+  for (let index = 0; index < failures; index++) addFailure("SOURCE_MISSING");
+  const sourceCoverageProgress = () => {
+    const succeeded = sourceCoverageStates.filter((state) => state.status === "completed").length;
+    const failed = sourceCoverageStates.filter((state) => state.status === "failed").length;
+    const running = sourceCoverageStates.filter((state) => state.status === "running").length;
+    return {
+      total: sourceCoverageStates.length,
+      settled: succeeded + failed,
+      succeeded,
+      failed,
+      running,
+      pending: sourceCoverageStates.length - succeeded - failed - running,
+      allSettled: succeeded + failed === sourceCoverageStates.length,
+      sources: sourceCoverageStates,
+    };
+  };
   const retainForAssessment = (doc: CrawledDocument) => {
     if (doc.error || !doc.text) return;
     if (doc.dateStatus === "within_range") {
@@ -400,12 +463,24 @@ async function runScan(scanId: string, request: ScanRequest) {
       const warning = "发布日期无法确认；若识别为项目，只进入人工审核，不自动通过";
       if (!doc.warnings.includes(warning)) doc.warnings.push(warning);
       documents.set(doc.canonicalUrl, doc);
+    } else if (doc.dateStatus === "date_conflict" && !request.referenceRows?.length) {
+      const warning = "页面存在多个日期候选；保留进入结构化评估，但结果必须人工复核发布日期";
+      if (!doc.warnings.includes(warning)) doc.warnings.push(warning);
+      documents.set(doc.canonicalUrl, doc);
     }
   };
   markScanActive(scanId, true);
   try {
-    setProgress(scanId, { startedAt: now() }, "running");
-    logScan(scanId, "info", "lifecycle", "started", "任务开始执行", { sources: sources.length });
+    setProgress(scanId, {
+      startedAt: now(), sourcesTotal: request.sourceIds.length,
+      sourcesScanned: completedSources, sourceCoverage: sourceCoverageProgress(),
+    }, "running");
+    logScan(scanId, "info", "lifecycle", "started", "任务开始执行", { sources: request.sourceIds.length });
+    for (const state of sourceCoverageStates.filter((item) => item.status === "failed")) {
+      logScan(scanId, "error", "discovery", "source_missing", state.error ?? "信息源不存在", {
+        sourceId: state.sourceId, source: state.name, url: state.url,
+      });
+    }
     const mcpProfiles = (request.mcpServerIds ?? []).map((id) => {
       const row = db.prepare("SELECT * FROM mcp_servers WHERE id=? AND enabled=1").get(id) as Record<string, unknown> | undefined;
       return row ? hydrateMcpRow(row) : undefined;
@@ -414,13 +489,16 @@ async function runScan(scanId: string, request: ScanRequest) {
     const genericMcpProfiles = mcpProfiles.filter((profile) => !(firecrawlApiKey && /firecrawl/i.test(profile.name)));
     const recallBaseline = getRecallBaseline(scanId, request);
     const baselineHints = new Map<string, Array<{ fields: Record<string, unknown>; primaryUrl: string }>>();
+    const baselineEvidenceByUrl = new Map<string, ResultRecord>();
     for (const result of recallBaseline?.results ?? []) {
+      if (!["approved", "auto_approved"].includes(result.status)) continue;
       for (const url of [result.primaryUrl, ...result.candidateUrls]) {
         const normalized = normalizeUrl(url);
         if (!normalized) continue;
         const hints = baselineHints.get(normalized) ?? [];
         hints.push({ fields: result.fields, primaryUrl: result.primaryUrl });
         baselineHints.set(normalized, hints);
+        if (!baselineEvidenceByUrl.has(normalized)) baselineEvidenceByUrl.set(normalized, result);
       }
     }
     if (recallBaseline) {
@@ -482,7 +560,18 @@ async function runScan(scanId: string, request: ScanRequest) {
       if (firecrawlApiKey) {
         mcpCalls++;
         try {
-          return await scrapeWithFirecrawl(firecrawlApiKey, args[0], args[1]);
+          const external = await scrapeWithFirecrawl(firecrawlApiKey, args[0], args[1]);
+          const externalQuality = documentContentQuality(external, args[0]);
+          if (externalQuality.reliable) return external;
+          logScan(scanId, "warn", "fetch", "external_content_quality_rejected",
+            `Firecrawl 返回了可访问页面，但正文质量未通过：${externalQuality.reasons.join("、") || "低质量正文"}；切换本机浏览器复核`, {
+              url: args[0], title: external.title, score: externalQuality.score, reasons: externalQuality.reasons,
+            });
+          const local = await fetchDocument(args[0], args[1], args[2], true);
+          const localQuality = documentContentQuality(local, args[0]);
+          const selected = localQuality.score > externalQuality.score ? local : external;
+          selected.warnings.push(`正文质量门控：Firecrawl ${externalQuality.score} 分，本机浏览器 ${localQuality.score} 分，已保留较高质量版本`);
+          return selected;
         } catch (error) {
           mcpFailures++;
           logScan(scanId, "warn", "mcp", "firecrawl_scrape_fallback_failed",
@@ -513,9 +602,38 @@ async function runScan(scanId: string, request: ScanRequest) {
       baselineUrlsAttempted++;
       discovered++;
       const source = sourceForUrl(url);
-      const doc = await fetchWithFallback(url, source?.id ?? "baseline", "source");
+      let doc = await fetchWithFallback(url, source?.id ?? "baseline", "source");
       fetched++;
       doc.dateStatus = dateStatusFor(doc, request.startDate, request.endDate);
+      const acceptedBaseline = baselineEvidenceByUrl.get(normalized);
+      const liveQuality = documentContentQuality(doc, url);
+      if (acceptedBaseline?.documentId && !liveQuality.reliable) {
+        const row = db.prepare("SELECT * FROM documents WHERE id=? AND scan_id=?")
+          .get(acceptedBaseline.documentId, String(recallBaseline?.scanId ?? "")) as Record<string, unknown> | undefined;
+        if (row?.text) {
+          const archivedCandidates = jsonParse<string[]>(row.date_candidates_json, []);
+          const archived: CrawledDocument = {
+            id: randomUUID(),
+            url: String(row.url), canonicalUrl: String(row.canonical_url), title: String(row.title),
+            publishedAt: row.published_at ? String(row.published_at) : null, fetchedAt: now(),
+            contentType: String(row.content_type), statusCode: Number(row.status_code), hash: String(row.hash),
+            text: String(row.text), markdown: String(row.markdown), rawPath: String(row.raw_path), markdownPath: String(row.markdown_path),
+            sourceId: source?.id ?? String(row.source_id), dateCandidates: archivedCandidates,
+            dateStatus: "date_unknown", dateEvidence: String(row.date_evidence ?? ""),
+            fetchMode: String(row.fetch_mode) as CrawledDocument["fetchMode"], rendered: Boolean(row.rendered),
+            discoveryMethod: "source", warnings: [...jsonParse<string[]>(row.warnings_json, []),
+              `实时页面正文质量退化（${liveQuality.reasons.join("、") || `${liveQuality.score}分`}）；已使用同口径已确认任务的原文归档重新评估`],
+            pageType: String(row.page_type) as CrawledDocument["pageType"], extractionMethod: `baseline-archive:${row.extraction_method}`,
+            attemptCount: doc.attemptCount, failureCode: undefined, error: undefined,
+          };
+          archived.dateStatus = dateStatusFor(archived, request.startDate, request.endDate);
+          doc = archived;
+          logScan(scanId, "warn", "recall", "baseline_archive_restored",
+            `实时页面正文与目标文章不一致，已恢复已确认原文归档：${archived.title}`, {
+              url, baselineScanId: recallBaseline?.scanId, liveQuality, archivedLength: archived.text.length,
+            });
+        }
+      }
       if (doc.error) {
         failures++; addFailure(doc.failureCode ?? "FETCH_ERROR");
         logScan(scanId, "warn", "recall", "baseline_url_failed", `历史项目页面回查失败：${doc.error}`, {
@@ -549,8 +667,6 @@ async function runScan(scanId: string, request: ScanRequest) {
     const baseSourceQuota = Math.floor(sourcePageBudget / Math.max(1, sources.length));
     const extraSourceSlots = sourcePageBudget % Math.max(1, sources.length);
     let activeSourceFetches = 0;
-    let completedSources = 0;
-    let nextSourceIndex = 0;
     const fetchWithinBudget = async (...args: Parameters<typeof fetchDocument>) => {
       if (fetched + activeSourceFetches >= request.budget.maxPages) return undefined;
       activeSourceFetches++;
@@ -560,6 +676,10 @@ async function runScan(scanId: string, request: ScanRequest) {
     const processSource = async (sourceIndex: number) => {
       await scanControlPoint(scanId);
       const source = sources[sourceIndex];
+      const coverageState = sourceCoverageStates.find((state) => state.sourceId === source.id)!;
+      coverageState.status = "running";
+      coverageState.startedAt = now();
+      setProgress(scanId, { sourceCoverage: sourceCoverageProgress() });
       logScan(scanId, "info", "discovery", "source_started", `开始枚举来源：${source.name}`, { sourceId: source.id, url: source.url });
       const sourceQuota = Math.max(1, baseSourceQuota + (sourceIndex < extraSourceSlots ? 1 : 0));
       let discovery: Awaited<ReturnType<typeof discoverSourcePages>> | undefined;
@@ -574,6 +694,7 @@ async function runScan(scanId: string, request: ScanRequest) {
             mapped = await mapWithFirecrawl(firecrawlApiKey, source.url, Math.max(12, sourceQuota * 6),
               `${request.startDate.slice(0, 4)} 光伏 储能 风电 项目 solar battery wind project`);
           }
+          mapped = rankDiscoveredUrls(mapped, source.url, request.startDate, request.endDate);
           if (mapped.length) discovery = {
             pages: mapped.slice(0, sourceQuota).map((url) => ({ url, method: "mcp" as const })),
             strategies: ["firecrawl-map"], discoveryPagesFetched: 1, truncated: mapped.length > sourceQuota, failures: [],
@@ -605,6 +726,7 @@ async function runScan(scanId: string, request: ScanRequest) {
         { strategies: discovery.strategies, discoveryPagesFetched: discovery.discoveryPagesFetched, truncated: discovery.truncated });
       let fetchedForSource = 0;
       let successfulForSource = 0;
+      let relevantForSource = 0;
       for (const page of discovery.pages) {
         await scanControlPoint(scanId);
         if (fetched >= request.budget.maxPages || fetchedForSource >= sourceQuota) break;
@@ -626,6 +748,14 @@ async function runScan(scanId: string, request: ScanRequest) {
           });
         } else {
           successfulForSource++;
+          const quality = documentContentQuality(doc, page.url);
+          if (quality.reliable && ["within_range", "date_unknown", "date_conflict"].includes(doc.dateStatus)) {
+            const signal = `${doc.title}\n${doc.text.slice(0, 20_000)}`;
+            if (/光伏|储能|新能源|太阳能|风电|电站|EPC|solar|photovoltaic|battery|storage|renewable|wind\s*(?:farm|power|energy)|energy project/i.test(signal) &&
+              /项目|电站|电场|园区|基地|中标|开工|投产|并网|签署|合同|收购|融资|获批|project|plant|farm|facility|award|contract|construction|commission|financ|approv/i.test(signal)) {
+              relevantForSource++;
+            }
+          }
           db.prepare("UPDATE crawl_queue SET status='done',last_error=NULL,updated_at=? WHERE scan_id=? AND url=?")
             .run(now(), scanId, page.url);
           logScan(scanId, "info", "fetch", "page_fetched", `${doc.title} · ${doc.pageType} · ${doc.fetchMode}`, {
@@ -645,20 +775,24 @@ async function runScan(scanId: string, request: ScanRequest) {
         saveDocument(scanId, doc);
         await delay(source.rateLimitMs);
       }
-      if (successfulForSource === 0 && searchProviders.length && searches < request.budget.maxSearches &&
-        fetchedForSource < sourceQuota) {
+      if (relevantForSource === 0 && searchProviders.length && searches < request.budget.maxSearches) {
         let hostname = "";
         try { hostname = new URL(source.url).hostname; } catch { /* discovery already recorded the invalid URL */ }
         const query = `site:${hostname} (光伏 OR 储能 OR 风电 OR solar OR battery) after:${request.startDate} before:${request.endDate}`;
         logScan(scanId, "warn", "discovery", "search_fallback_started",
-          `${source.name} 直接枚举未取得正文，切换到站内搜索索引回退`, { sourceId: source.id, query });
+          `${source.name} 直接枚举未取得合格项目候选正文，切换到站内搜索索引回退`, { sourceId: source.id, query });
         for (const searchProvider of searchProviders) {
-          if (searches >= request.budget.maxSearches || fetchedForSource >= sourceQuota) break;
+          const reservedCoverageSlots = sourceCoverageStates.filter((state) =>
+            state.sourceId !== source.id && ["pending", "running"].includes(state.status)).length;
+          if (searches >= request.budget.maxSearches ||
+            fetched + activeSourceFetches + reservedCoverageSlots >= request.budget.maxPages) break;
           searches++;
           try {
-            const hits = await searchWeb(searchProvider, query, Math.min(8, sourceQuota - fetchedForSource));
+            const hits = await searchWeb(searchProvider, query, 5);
             for (const hit of hits) {
-              if (fetched >= request.budget.maxPages || fetchedForSource >= sourceQuota) break;
+              const liveReservedSlots = sourceCoverageStates.filter((state) =>
+                state.sourceId !== source.id && ["pending", "running"].includes(state.status)).length;
+              if (fetched + activeSourceFetches + liveReservedSlots >= request.budget.maxPages || relevantForSource > 0) break;
               const normalized = normalizeUrl(hit.url);
               if (!normalized || fetchedUrls.has(normalized)) continue;
               fetchedUrls.add(normalized); discovered++;
@@ -675,6 +809,13 @@ async function runScan(scanId: string, request: ScanRequest) {
                 else if (doc.dateStatus === "date_conflict") dateConflict++;
                 else dateUnknown++;
                 retainForAssessment(doc);
+                const quality = documentContentQuality(doc, hit.url);
+                const signal = `${doc.title}\n${doc.text.slice(0, 20_000)}`;
+                if (quality.reliable && ["within_range", "date_unknown", "date_conflict"].includes(doc.dateStatus) &&
+                  /光伏|储能|新能源|太阳能|风电|电站|EPC|solar|photovoltaic|battery|storage|renewable|wind/i.test(signal) &&
+                  /项目|电站|电场|园区|基地|中标|开工|投产|并网|签署|合同|融资|project|plant|farm|facility|award|contract|construction|commission|financ/i.test(signal)) {
+                  relevantForSource++;
+                }
               }
               saveDocument(scanId, doc);
             }
@@ -685,26 +826,55 @@ async function runScan(scanId: string, request: ScanRequest) {
           }
         }
       }
-      const sourcesScanned = ++completedSources;
-      setProgress(scanId, {
-        sourcesScanned, pagesDiscovered: discovered, pagesFetched: fetched,
-        fullTextSucceeded, withinRange, outsideRange, dateUnknown, dateConflict, dynamicPages,
-        discoveryTruncated, discoveryStrategies: [...discoveryStrategies], failures, failureReasons,
-        percent: Math.min(65, Math.round((sourcesScanned / Math.max(1, sources.length)) * 60)),
-      });
-    };
-    const sourceWorker = async () => {
-      while (true) {
-        const sourceIndex = nextSourceIndex++;
-        if (sourceIndex >= sources.length) return;
-        await processSource(sourceIndex);
-      }
+      return { discovered: discovery.pages.length, fetched: fetchedForSource, succeeded: successfulForSource };
     };
     const sourceConcurrency = Math.max(1, Math.min(request.budget.maxConcurrency, sources.length));
     logScan(scanId, "info", "discovery", "parallel_sources_started", `并发监测 ${sourceConcurrency} 个网站`, {
       selectedSources: sources.length, maxConcurrency: sourceConcurrency,
     });
-    await Promise.all(Array.from({ length: sourceConcurrency }, () => sourceWorker()));
+    await runAllSourceJobs(sources, sourceConcurrency, async (_source, sourceIndex) => processSource(sourceIndex), (outcome) => {
+      const state = sourceCoverageStates.find((item) => item.sourceId === outcome.item.id)!;
+      completedSources++;
+      state.completedAt = now();
+      if (outcome.status === "fulfilled") {
+        state.discovered = outcome.value.discovered;
+        state.fetched = outcome.value.fetched;
+        state.succeeded = outcome.value.succeeded;
+        if (outcome.value.succeeded > 0) {
+          state.status = "completed";
+        } else {
+          state.status = "failed";
+          state.error = "已完成枚举和抓取尝试，但未取得可用网页正文";
+          failures++;
+          addFailure("SOURCE_NO_CONTENT");
+          logScan(scanId, "warn", "discovery", "source_no_content", `${outcome.item.name} 已完成扫描，但未取得可用正文`, {
+            sourceId: outcome.item.id, source: outcome.item.name, url: outcome.item.url,
+          });
+        }
+      } else {
+        const message = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+        state.status = "failed";
+        state.error = message;
+        failures++;
+        addFailure("SOURCE_SCAN_ERROR");
+        logScan(scanId, "error", "discovery", "source_scan_failed", `来源扫描发生未预期错误，已隔离并继续处理其他网站：${message}`, {
+          sourceId: outcome.item.id, source: outcome.item.name, url: outcome.item.url,
+        });
+      }
+      setProgress(scanId, {
+        sourcesScanned: completedSources, sourceCoverage: sourceCoverageProgress(),
+        pagesDiscovered: discovered, pagesFetched: fetched,
+        fullTextSucceeded, withinRange, outsideRange, dateUnknown, dateConflict, dynamicPages,
+        discoveryTruncated, discoveryStrategies: [...discoveryStrategies], failures, failureReasons,
+        percent: Math.min(65, Math.round((completedSources / Math.max(1, request.sourceIds.length)) * 60)),
+      });
+    }, (error) => error instanceof ScanStoppedError);
+    if (completedSources !== request.sourceIds.length || !sourceCoverageProgress().allSettled) {
+      throw new Error(`来源覆盖不完整：仅结算 ${completedSources}/${request.sourceIds.length} 个选定网站，任务禁止标记为完成`);
+    }
+    logScan(scanId, sourceCoverageProgress().failed ? "warn" : "info", "discovery", "all_sources_settled",
+      `所有选定网站均已处理：${completedSources}/${request.sourceIds.length}，成功 ${sourceCoverageProgress().succeeded}，失败 ${sourceCoverageProgress().failed}`,
+      { sourceCoverage: sourceCoverageProgress() });
     if (request.referenceRows?.length && searchProviders.length) {
       for (const reference of request.referenceRows) {
         if (searches >= request.budget.maxSearches || fetched >= request.budget.maxPages) break;
@@ -790,6 +960,7 @@ async function runScan(scanId: string, request: ScanRequest) {
       discoveryTruncated, discoveryStrategies: [...discoveryStrategies],
       projectArticles, nonProjectArticles, uncertainArticles, projectMentions,
       results: resultCount, failures, failureReasons, recall: recallProgress, percent: 100, completedAt: now(),
+      sourcesScanned: completedSources, sourceCoverage: sourceCoverageProgress(),
     }, "completed");
     logScan(scanId, "info", "lifecycle", "completed", `任务完成，生成 ${resultCount} 个项目`, {
       pagesFetched: fetched, failures, failureReasons, projectArticles, projectMentions: projectMentions,
@@ -801,10 +972,11 @@ async function runScan(scanId: string, request: ScanRequest) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (error instanceof ScanStoppedError) {
-      setProgress(scanId, { stoppedAt: now(), failureReasons }, "stopped");
+      setProgress(scanId, { stoppedAt: now(), failureReasons, sourcesScanned: completedSources, sourceCoverage: sourceCoverageProgress() }, "stopped");
       logScan(scanId, "warn", "lifecycle", "stopped", "任务已停止，已完成的数据和日志均已保留");
       audit("scan", scanId, "stopped", { message });
     } else {
+      setProgress(scanId, { failedAt: now(), failureReasons, sourcesScanned: completedSources, sourceCoverage: sourceCoverageProgress() }, "failed");
       db.prepare("UPDATE scans SET status='failed', error=?, updated_at=? WHERE id=?").run(message, now(), scanId);
       logScan(scanId, "error", "lifecycle", "failed", `任务失败：${message}`, { failureReasons });
       audit("scan", scanId, "failed", { message });
@@ -1313,11 +1485,34 @@ async function route(req: IncomingMessage, res: ServerResponse) {
 
     const deepMatch = url.pathname.match(/^\/api\/results\/([^/]+)\/deep-expand$/);
     if (req.method === "POST" && deepMatch) return sendJson(res, 200, await deepExpand(deepMatch[1], body));
+    const bilingualRepair = url.pathname.match(/^\/api\/results\/([^/]+)\/repair-bilingual$/);
+    if (req.method === "POST" && bilingualRepair) {
+      const project = db.prepare("SELECT * FROM projects WHERE id=?").get(bilingualRepair[1]) as Record<string, unknown> | undefined;
+      if (!project) throw new Error("项目结果不存在");
+      const scan = getScan(String(project.scan_id));
+      if (!scan) throw new Error("项目所属监测任务不存在");
+      const provider = getProvider(String(scan.request.providerId ?? ""));
+      const modelId = String(scan.request.modelId ?? "");
+      if (!provider || !modelId) throw new Error("该任务没有可用的大模型配置，无法补齐双语字段");
+      const documentRow = db.prepare("SELECT * FROM documents WHERE id=?").get(String(project.primary_document_id ?? "")) as Record<string, unknown> | undefined;
+      if (!documentRow?.text) throw new Error("项目原始网页正文存档不存在");
+      const analyzed = await assessArticle(storedDocument(documentRow), listFields(), provider, modelId);
+      const repaired = applyBilingualRepair(bilingualRepair[1], analyzed.assessment, listFields());
+      audit("project", bilingualRepair[1], "bilingual_repaired", { modelId, modelUsed: analyzed.modelUsed });
+      return sendJson(res, 200, repaired);
+    }
     const decisionMatch = url.pathname.match(/^\/api\/results\/([^/]+)\/decision$/);
     if (req.method === "POST" && decisionMatch) return sendJson(res, 200, reviewResult(decisionMatch[1], body));
     if (req.method === "POST" && url.pathname === "/api/snapshots") return sendJson(res, 201, confirmSnapshot(body));
+    if (req.method === "POST" && url.pathname === "/api/export-directories/pick") {
+      return sendJson(res, 200, await pickExportDirectory());
+    }
     const exportMatch = url.pathname.match(/^\/api\/snapshots\/([^/]+)\/export$/);
-    if (req.method === "POST" && exportMatch) return sendJson(res, 200, await exportSnapshot(exportMatch[1]));
+    if (req.method === "POST" && exportMatch) {
+      const directoryToken = String(body.directoryToken ?? "");
+      const directory = directoryToken ? resolveExportDirectory(directoryToken) : undefined;
+      return sendJson(res, 200, await exportSnapshot(exportMatch[1], directory));
+    }
     const exportFile = url.pathname.match(/^\/api\/exports\/([^/]+)\/files\/([^/]+)$/);
     if (req.method === "GET" && exportFile) return sendExportFile(res, exportFile[1], exportFile[2]);
     const exportStaging = url.pathname.match(/^\/api\/exports\/([^/]+)\/staging$/);
