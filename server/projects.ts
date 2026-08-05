@@ -95,7 +95,9 @@ export function detectSourceLanguage(document: CrawledDocument) {
   const sample = `${document.title}\n${document.text.slice(0, 20_000)}`;
   const letters = sample.match(/[\p{L}]/gu)?.length ?? 0;
   const chinese = sample.match(/[\u3400-\u9fff]/g)?.length ?? 0;
-  return letters > 100 && chinese / letters < 0.15 ? "foreign" : "zh";
+  const latin = sample.match(/[A-Za-z]/g)?.length ?? 0;
+  if (letters > 100 && chinese / letters < 0.15) return latin / letters >= 0.55 ? "en" : "foreign";
+  return "zh";
 }
 
 function clamp(value: number) {
@@ -125,12 +127,102 @@ export function ruleAssessment(document: CrawledDocument, fields: FieldDefinitio
   };
 }
 
+type PriorProjectHint = { fields: Record<string, unknown>; primaryUrl: string };
+
+function verifiedHintAssessment(document: CrawledDocument, fields: FieldDefinition[], hints: PriorProjectHint[]) {
+  const body = `${document.title}\n${document.text}`;
+  const normalizedBody = normalizedText(body);
+  const mentions = hints.flatMap((hint) => {
+    const projectName = String(hint.fields.project_name ?? "").trim();
+    const normalizedName = normalizedText(projectName);
+    if (!normalizedName || !normalizedBody.includes(normalizedName)) return [];
+    const start = Math.max(0, body.toLowerCase().indexOf(projectName.toLowerCase()) - 100);
+    const snippet = body.slice(start, start + projectName.length + 320).replace(/\s+/g, " ").trim();
+    const values = Object.fromEntries(fields.map((field) => [field.id, hint.fields[field.id] ?? null]));
+    const originalFields = Object.fromEntries(fields.map((field) => [field.id,
+      values[field.id] === null || values[field.id] === undefined ? "" : String(values[field.id])]));
+    const evidence = Object.fromEntries(fields.flatMap((field) => {
+      const value = values[field.id];
+      if (field.id === "project_name") return [[field.id, snippet]];
+      if (value === null || value === undefined || value === "") return [];
+      return body.includes(String(value)) ? [[field.id, snippet]] : [];
+    }));
+    return [{ fields: values, originalFields, evidence, evidenceTranslations: { ...evidence }, confidence: 0.86 }];
+  });
+  if (!mentions.length) return null;
+  return {
+    classification: "project_report" as const,
+    confidence: 0.86,
+    reasoning: "当前正文逐字命中已确认历史项目名称；沿用历史结构化字段并以本次正文重新建立证据，结果进入质量复核",
+    sourceLanguage: detectSourceLanguage(document),
+    mentions,
+  };
+}
+
+function modelAssessmentPayloadIsComplete(value: unknown) {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return ["project_report", "non_project", "uncertain"].includes(String(item.classification)) &&
+    Number.isFinite(Number(item.confidence)) && typeof item.reasoning === "string" && item.reasoning.trim().length >= 4 &&
+    typeof item.sourceLanguage === "string" && Array.isArray(item.mentions);
+}
+
+export function bilingualAssessmentGaps(assessment: ArticleAssessment, fields: FieldDefinition[]) {
+  if (!assessment.sourceLanguage || /^zh(?:-|$)/i.test(assessment.sourceLanguage) || assessment.classification !== "project_report") return [];
+  const translatedTextFields = new Set(["project_name", "country", "address", "progress", "category", "project_type"]);
+  const gaps: string[] = [];
+  assessment.mentions.forEach((mention, index) => {
+    for (const field of fields) {
+      const translated = String(mention.fields[field.id] ?? "").trim();
+      const original = String(mention.originalFields?.[field.id] ?? "").trim();
+      const evidence = String(mention.evidence[field.id] ?? "").trim();
+      const evidenceTranslation = String(mention.evidenceTranslations?.[field.id] ?? "").trim();
+      if ((translated || evidence) && !original) gaps.push(`${index}:${field.id}:original`);
+      if (evidence && !evidenceTranslation) gaps.push(`${index}:${field.id}:evidence_translation`);
+      if (translatedTextFields.has(field.id) && translated && original && translated.toLowerCase() === original.toLowerCase() &&
+        /[A-Za-z]{4}/.test(original) && !/[\u3400-\u9fff]/.test(translated)) gaps.push(`${index}:${field.id}:field_translation`);
+    }
+  });
+  return [...new Set(gaps)];
+}
+
+async function repairBilingualAssessment(
+  assessment: ArticleAssessment, document: CrawledDocument, fields: FieldDefinition[],
+  provider: ModelProviderRecord, modelId: string,
+) {
+  const gaps = bilingualAssessmentGaps(assessment, fields);
+  if (!gaps.length) return assessment;
+  const repaired = await callModel(provider, modelId, `修复下面外文网页的结构化项目结果，使其完整满足中英双语要求。
+
+必须遵守：
+1. fields 是准确中文提炼；originalFields 是网页原语言写法。专有机构名可保留原名，但描述性项目名、国家、地点、进展和项目类型必须翻译成中文。
+2. evidence 逐字保留网页原文；每条非空 evidence 都必须有对应的中文 evidenceTranslations。
+3. 数值字段 fields 使用规定标准单位，originalFields 保留原数字和原单位；不得猜测正文没有的数据。
+4. 保留原项目数量和分类，只修复双语缺口。只返回 JSON。
+
+待修复缺口：${gaps.join("、")}
+现有结果：${JSON.stringify(assessment)}
+网页标题：${document.title}
+网页正文：${document.text.slice(0, 24_000)}`, articleAnalysisSchema(fields));
+  if (!modelAssessmentPayloadIsComplete(repaired)) throw new Error("双语修复返回结构不完整");
+  const normalized = normalizeAssessment(repaired, document, fields);
+  if (normalized.classification !== "project_report" || !normalized.mentions.length) throw new Error("双语修复丢失了项目实体");
+  const remaining = bilingualAssessmentGaps(normalized, fields);
+  if (remaining.length) {
+    normalized.reasoning = `${normalized.reasoning}；仍有 ${remaining.length} 个双语字段待人工复核`;
+    normalized.confidence = Math.min(normalized.confidence, 0.58);
+    normalized.mentions = normalized.mentions.map((mention) => ({ ...mention, confidence: Math.min(mention.confidence, 0.58) }));
+  }
+  return normalized;
+}
+
 export async function assessArticle(
   document: CrawledDocument, fields: FieldDefinition[], provider?: ModelProviderRecord, modelId?: string,
-  priorProjectHints: Array<{ fields: Record<string, unknown>; primaryUrl: string }> = [],
+  priorProjectHints: PriorProjectHint[] = [],
 ) {
   const fallback = ruleAssessment(document, fields);
-  if (!provider || !modelId || !document.text) return { assessment: fallback, modelUsed: false, error: "" };
+  const verifiedHints = verifiedHintAssessment(document, fields, priorProjectHints);
+  if (!provider || !modelId || !document.text) return { assessment: verifiedHints ?? fallback, modelUsed: false, error: "" };
   const likelihood = ruleProjectLikelihood(document);
   // Keep the model budget for plausible project articles. Homepage, listing and
   // clearly non-energy pages are deterministically classified by the rule layer.
@@ -175,16 +267,57 @@ export async function assessArticle(
 ${priorHintText}${document.text.slice(0, 100_000)}`,
       articleAnalysisSchema(fields),
     );
-    const assessment = normalizeAssessment(result, document, fields);
+    if (!modelAssessmentPayloadIsComplete(result)) {
+      throw new Error("模型返回的结构化结果缺少 classification、reasoning、sourceLanguage 或 mentions，已拒绝空壳结果");
+    }
+    let assessment = normalizeAssessment(result, document, fields);
+    if (bilingualAssessmentGaps(assessment, fields).length) {
+      assessment = await repairBilingualAssessment(assessment, document, fields, provider, modelId);
+    }
     if (assessment.classification === "project_report" && !assessment.mentions.length) {
       return {
         assessment: { ...assessment, classification: "uncertain" as const, reasoning: `${assessment.reasoning}；模型未返回项目实体` },
         modelUsed: true, error: "",
       };
     }
+    if (verifiedHints) {
+      const existingNames = new Set(assessment.mentions.map((mention) => normalizedText(mention.fields.project_name)));
+      const missingVerifiedMentions = verifiedHints.mentions.filter((mention) => !existingNames.has(normalizedText(mention.fields.project_name)));
+      if (assessment.classification !== "project_report" || missingVerifiedMentions.length) {
+        return {
+          assessment: {
+            ...verifiedHints,
+            mentions: assessment.classification === "project_report"
+              ? [...assessment.mentions, ...missingVerifiedMentions]
+              : verifiedHints.mentions,
+            reasoning: assessment.classification === "project_report"
+              ? `${assessment.reasoning}；并补回 ${missingVerifiedMentions.length} 个正文已逐字命中的已确认历史项目`
+              : `${assessment.reasoning}；但当前正文逐字命中已确认历史项目名称，按可审计召回保护规则保留`,
+          },
+          modelUsed: true,
+          error: "",
+        };
+      }
+    }
     return { assessment, modelUsed: true, error: "" };
   } catch (error) {
-    return { assessment: fallback, modelUsed: false, error: error instanceof Error ? error.message : String(error) };
+    const primaryError = error instanceof Error ? error.message : String(error);
+    try {
+      const recovery = await callModel(provider, modelId, `从下面外文或中文网页中抽取现实新能源项目。只返回符合 JSON Schema 的对象；外文网页必须让 fields 为中文、originalFields 为原文、evidence 为原文证据、evidenceTranslations 为中文证据翻译。数值标准化为 MW/MWh，originalFields 保留原单位。\n标题：${document.title}\n正文：${document.text.slice(0, 14_000)}`, articleAnalysisSchema(fields));
+      if (!modelAssessmentPayloadIsComplete(recovery)) throw new Error("精简恢复结果结构不完整");
+      let recovered = normalizeAssessment(recovery, document, fields);
+      if (bilingualAssessmentGaps(recovered, fields).length) recovered = await repairBilingualAssessment(recovered, document, fields, provider, modelId);
+      return { assessment: recovered, modelUsed: true, error: `首次抽取失败后已通过精简双语模式恢复：${primaryError}` };
+    } catch (recoveryError) {
+      const assessment = verifiedHints ?? fallback;
+      const gaps = bilingualAssessmentGaps(assessment, fields);
+      if (gaps.length) {
+        assessment.reasoning = `${assessment.reasoning}；外文双语自动修复失败，结果仅供人工复核`;
+        assessment.confidence = Math.min(assessment.confidence, 0.5);
+        assessment.mentions = assessment.mentions.map((mention) => ({ ...mention, confidence: Math.min(mention.confidence, 0.5) }));
+      }
+      return { assessment, modelUsed: false, error: `${primaryError}；精简双语恢复失败：${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}` };
+    }
   }
 }
 
@@ -208,6 +341,11 @@ export function saveAssessment(
     for (const warning of measurementValidation.warnings) if (!document.warnings.includes(warning)) document.warnings.push(warning);
     const evidenceTranslations = mention.evidenceTranslations ?? {};
     const sourceLanguage = assessment.sourceLanguage ?? detectSourceLanguage(document);
+    const bilingualGaps = bilingualAssessmentGaps({ ...assessment, mentions: [mention] }, fields);
+    if (bilingualGaps.length) {
+      const warning = `外文双语字段不完整（${bilingualGaps.length}项），已强制进入人工复核`;
+      if (!document.warnings.includes(warning)) document.warnings.push(warning);
+    }
     const generatedFields: string[] = [];
     if (!hasValue(normalizedFields.project_name) || invalidProjectName(normalizedFields.project_name, normalizedFields, document)) {
       normalizedFields.project_name = synthesizeProjectName(normalizedFields);
@@ -238,6 +376,40 @@ export function saveAssessment(
   });
   db.prepare("UPDATE documents SET warnings_json=? WHERE id=?").run(JSON.stringify(document.warnings), document.id);
   return projectIds;
+}
+
+export function applyBilingualRepair(projectId: string, assessment: ArticleAssessment, fields: FieldDefinition[]) {
+  const row = db.prepare("SELECT * FROM projects WHERE id=?").get(projectId) as Record<string, unknown> | undefined;
+  if (!row) throw new Error("项目结果不存在");
+  if (assessment.classification !== "project_report" || !assessment.mentions.length) throw new Error("双语修复未返回项目实体");
+  const currentFields = jsonParse<Record<string, unknown>>(row.fields_json, {});
+  const ranked = assessment.mentions.map((mention) => ({
+    mention, score: nameSimilarity(currentFields.project_name, mention.fields.project_name),
+  })).sort((left, right) => right.score - left.score);
+  const mention = ranked[0].mention;
+  const remaining = bilingualAssessmentGaps({ ...assessment, mentions: [mention] }, fields);
+  if (remaining.length) throw new Error(`双语修复仍缺少 ${remaining.length} 项，未覆盖现有结果`);
+  const existingOriginal = jsonParse<Record<string, string>>(row.original_fields_json, {});
+  const nextFields = { ...currentFields };
+  const nextOriginal = { ...existingOriginal };
+  for (const field of fields) {
+    if (hasValue(mention.fields[field.id])) nextFields[field.id] = mention.fields[field.id];
+    if (mention.originalFields?.[field.id]) nextOriginal[field.id] = mention.originalFields[field.id];
+  }
+  const measurementValidation = normalizeMeasurementFields(nextFields, fields, nextOriginal, mention.evidence);
+  const unitChecks = {
+    ...jsonParse<Record<string, string>>(row.unit_checks_json, {}),
+    ...measurementValidation.checks,
+  };
+  const conflicts = jsonParse<string[]>(row.conflicts_json, []).filter((item) => !item.includes("外文双语字段不完整"));
+  const sourceUrl = String(row.primary_url ?? "");
+  db.prepare(`UPDATE projects SET fields_json=?,original_fields_json=?,evidence_json=?,evidence_translations_json=?,
+    source_language=?,unit_checks_json=?,conflicts_json=?,status='review',revision=revision+1,updated_at=? WHERE id=?`).run(
+      JSON.stringify(measurementValidation.fields), JSON.stringify(nextOriginal), JSON.stringify(evidenceWithSource(mention.evidence, sourceUrl)),
+      JSON.stringify(evidenceWithSource(mention.evidenceTranslations ?? {}, sourceUrl)), String(assessment.sourceLanguage ?? row.source_language ?? "foreign"),
+      JSON.stringify(unitChecks), JSON.stringify(conflicts), now(), projectId,
+    );
+  return mapProject(db.prepare("SELECT * FROM projects WHERE id=?").get(projectId) as Record<string, unknown>);
 }
 
 function invalidProjectName(value: unknown, fields: Record<string, unknown>, document: CrawledDocument) {

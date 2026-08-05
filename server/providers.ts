@@ -158,13 +158,18 @@ export async function callModel(
 ): Promise<unknown> {
   let lastError = "";
   let candidatePrompt = compactModelPrompt(prompt, 48_000);
+  let candidateSchema = schema;
   for (let attempt = 1; attempt <= 2; attempt++) {
-    try { return await callModelOnce(provider, modelId, candidatePrompt, schema); }
+    try { return await callModelOnce(provider, modelId, candidatePrompt, candidateSchema); }
     catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
       const retryable = /timeout|aborted|fetch failed|HTTP (?:408|425|429|5\d\d)|empty|JSON/i.test(lastError);
       if (!retryable || attempt === 2) break;
       candidatePrompt = compactModelPrompt(candidatePrompt, 26_000);
+      if (schema && /empty|JSON|response_format|schema/i.test(lastError)) {
+        candidatePrompt = `${candidatePrompt}\n\n兼容模式：只返回一个 JSON 对象，不要 Markdown、解释或思维过程。对象必须满足：\n${JSON.stringify(schema)}`;
+        candidateSchema = undefined;
+      }
       await new Promise((resolve) => setTimeout(resolve, 900 + Math.floor(Math.random() * 350)));
     }
   }
@@ -197,7 +202,7 @@ async function callModelOnce(
       body: JSON.stringify({ model: modelId, max_tokens: maxOutputTokens, messages: [{ role: "user", content: schema ? `${prompt}\n\n必须只返回符合以下 JSON Schema 的 JSON：\n${JSON.stringify(schema)}` : prompt }] }),
     }, timeout);
     const block = Array.isArray(data.content) ? data.content[0] as JsonObject : {};
-    return parseJsonText(String(block.text ?? ""));
+    return parseModelJsonText(String(block.text ?? ""));
   }
   if (provider.kind === "gemini") {
     const data = await fetchJson(`${joinUrl(provider.baseUrl, `v1beta/models/${modelId}:generateContent`)}?key=${encodeURIComponent(apiKey)}`, {
@@ -209,7 +214,7 @@ async function callModelOnce(
     }, timeout);
     const candidates = data.candidates as JsonObject[] | undefined;
     const parts = (candidates?.[0]?.content as JsonObject | undefined)?.parts as JsonObject[] | undefined;
-    return parseJsonText(String(parts?.[0]?.text ?? ""));
+    return parseModelJsonText(String(parts?.[0]?.text ?? ""));
   }
   if (provider.kind === "openai") {
     const body: JsonObject = { model: modelId, input: prompt, max_output_tokens: maxOutputTokens };
@@ -217,7 +222,7 @@ async function callModelOnce(
     const data = await fetchJson(joinUrl(provider.baseUrl, "v1/responses"), {
       method: "POST", headers, body: JSON.stringify(body),
     }, timeout);
-    return parseJsonText(extractOpenAIResponseText(data));
+    return parseModelJsonText(extractOpenAIResponseText(data));
   }
   const endpoint = provider.kind === "azure-openai"
     ? `${joinUrl(provider.baseUrl, `openai/deployments/${modelId}/chat/completions`)}?api-version=${provider.config.apiVersion ?? "2024-10-21"}`
@@ -240,7 +245,7 @@ async function callModelOnce(
   }
   const choices = data.choices as JsonObject[] | undefined;
   const message = choices?.[0]?.message as JsonObject | undefined;
-  return parseJsonText(String(message?.content ?? ""));
+  return parseModelJsonText(String(message?.content ?? ""));
 }
 
 function extractOpenAIResponseText(data: JsonObject) {
@@ -253,9 +258,19 @@ function extractOpenAIResponseText(data: JsonObject) {
   return "";
 }
 
-function parseJsonText(text: string) {
-  const cleaned = text.trim().replace(/^```json\s*/i, "").replace(/```$/, "").trim();
-  try { return JSON.parse(cleaned); } catch { return { text: cleaned }; }
+export function parseModelJsonText(text: string) {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/, "").trim();
+  const candidates = [cleaned];
+  const objectStart = cleaned.indexOf("{");
+  const objectEnd = cleaned.lastIndexOf("}");
+  if (objectStart >= 0 && objectEnd > objectStart) candidates.push(cleaned.slice(objectStart, objectEnd + 1));
+  const arrayStart = cleaned.indexOf("[");
+  const arrayEnd = cleaned.lastIndexOf("]");
+  if (arrayStart >= 0 && arrayEnd > arrayStart) candidates.push(cleaned.slice(arrayStart, arrayEnd + 1));
+  for (const candidate of [...new Set(candidates.filter(Boolean))]) {
+    try { return JSON.parse(candidate); } catch { /* try the next bounded JSON candidate */ }
+  }
+  throw new Error(`模型返回空内容或无效 JSON：${cleaned.slice(0, 240) || "<empty>"}`);
 }
 
 function getByPath(value: unknown, path: string): unknown {

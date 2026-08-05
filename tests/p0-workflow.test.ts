@@ -229,3 +229,80 @@ test("turns Firecrawl markdown into an auditable crawled document", async () => 
   assert.match(document.warnings.join(" "), /Firecrawl/);
   assert.ok(fs.existsSync(document.rawPath));
 });
+
+test("rejects mismatched listing text returned for an article URL", async () => {
+  const { documentContentQuality, documentFromExternalContent } = await import("../server/crawler");
+  const document = documentFromExternalContent({
+    url: "https://example.test/details/energy-project.html", sourceId: "quality", provider: "Firecrawl",
+    title: "Bulgaria 500 MW battery project reaches financial close", publishedAt: "2026-08-04",
+    markdown: "Morocco storage headline 08-05 Nigeria grid headline 08-05 China storage headline 08-04 India solar headline 08-03 Oman wind headline 08-02 Spain battery headline 08-01",
+  });
+  const quality = documentContentQuality(document);
+  assert.equal(quality.reliable, false);
+  assert.ok(quality.reasons.includes("TITLE_BODY_MISMATCH"));
+});
+
+test("ranks dated article URLs ahead of source homepages and parses day-first dates", async () => {
+  const { dateStatusFor, documentFromExternalContent, rankDiscoveredUrls } = await import("../server/crawler");
+  const ranked = rankDiscoveredUrls([
+    "https://example.test/", "https://example.test/about", "https://example.test/news/2026-08/project.html",
+  ], "https://example.test/", "2026-07-01", "2026-08-31");
+  assert.equal(ranked[0], "https://example.test/news/2026-08/project.html");
+  const document = documentFromExternalContent({
+    url: "https://example.test/en/news/project", sourceId: "date", provider: "Firecrawl",
+    markdown: "News Kazakhstan 22.05.2026 753 MW renewable energy projects selected under the auction framework.",
+  });
+  assert.equal(document.publishedAt, "2026-05-22");
+  assert.equal(dateStatusFor(document, "2026-07-01", "2026-08-31"), "outside_range");
+});
+
+test("uses verified accepted-history names when model extraction is unavailable", async () => {
+  const [{ assessArticle }, { listFields }] = await Promise.all([
+    import("../server/projects"), import("../server/db"),
+  ]);
+  const document = {
+    id: crypto.randomUUID(), url: "https://example.test/news/2026/storage", canonicalUrl: "https://example.test/news/2026/storage",
+    title: "集团要闻", publishedAt: "2026-07-31", fetchedAt: new Date().toISOString(), contentType: "text/html",
+    statusCode: 200, hash: "hint", text: "芦子庙80万千瓦时独立储能电站正在建设，察右前旗天皮山50万千瓦工业园区绿电项目施工加快。",
+    markdown: "", rawPath: "", markdownPath: "", sourceId: "source", dateCandidates: ["2026-07-31"], dateStatus: "within_range",
+    dateEvidence: "2026-07-31", fetchMode: "static", rendered: false, warnings: [], pageType: "article", extractionMethod: "test", attemptCount: 1,
+  } as const;
+  const analyzed = await assessArticle(document, listFields(), undefined, undefined, [
+    { primaryUrl: document.url, fields: { project_name: "芦子庙80万千瓦时独立储能电站", storage_capacity_mwh: 800, country: "中国" } },
+    { primaryUrl: document.url, fields: { project_name: "察右前旗天皮山50万千瓦工业园区绿电项目", country: "中国" } },
+  ]);
+  assert.equal(analyzed.assessment.classification, "project_report");
+  assert.equal(analyzed.assessment.mentions.length, 2);
+});
+
+test("extracts bounded JSON and rejects non-JSON model output", async () => {
+  const { parseModelJsonText } = await import("../server/providers");
+  assert.deepEqual(parseModelJsonText("analysis omitted\n```json\n{\"ok\":true}\n```"), { ok: true });
+  assert.throws(() => parseModelJsonText("I cannot produce JSON"), /无效 JSON/);
+});
+
+test("requires original values and Chinese evidence translations for foreign projects", async () => {
+  const { bilingualAssessmentGaps } = await import("../server/projects");
+  const fields = [{ id: "project_name", label: "项目名称", type: "string", aliases: [], required: true, position: 0 }];
+  const incomplete = {
+    classification: "project_report" as const, confidence: 0.8, reasoning: "test", sourceLanguage: "en",
+    mentions: [{ fields: { project_name: "Orion Battery Project" }, originalFields: { project_name: "Orion Battery Project" },
+      evidence: { project_name: "Orion Battery Project reached financial close." }, evidenceTranslations: {}, confidence: 0.8 }],
+  };
+  assert.deepEqual(bilingualAssessmentGaps(incomplete, fields).sort(), [
+    "0:project_name:evidence_translation", "0:project_name:field_translation",
+  ]);
+  const complete = {
+    ...incomplete, mentions: [{ ...incomplete.mentions[0], fields: { project_name: "猎户座储能项目" },
+      evidenceTranslations: { project_name: "猎户座储能项目已完成融资交割。" } }],
+  };
+  assert.deepEqual(bilingualAssessmentGaps(complete, fields), []);
+});
+
+test("uses an opaque expiring grant for a writable export directory", async () => {
+  const { grantExportDirectory, resolveExportDirectory } = await import("../server/export-directory");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "dpm-export-target-"));
+  const grant = grantExportDirectory(directory);
+  assert.notEqual(grant.token, directory);
+  assert.equal(resolveExportDirectory(grant.token), path.resolve(directory));
+});

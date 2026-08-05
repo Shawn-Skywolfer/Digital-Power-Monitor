@@ -29,7 +29,7 @@ function mapResult(row: Record<string, unknown>): ResultRecord {
   };
 }
 
-export async function exportSnapshot(snapshotId: string) {
+export async function exportSnapshot(snapshotId: string, targetDirectory?: string) {
   const snapshot = db.prepare("SELECT * FROM snapshots WHERE id=?").get(snapshotId) as Record<string, unknown> | undefined;
   if (!snapshot) throw new Error("快照不存在");
   const resultIds = jsonParse<string[]>(snapshot.result_ids_json, []);
@@ -46,10 +46,12 @@ export async function exportSnapshot(snapshotId: string) {
   const scan = db.prepare("SELECT progress_json FROM scans WHERE id=?").get(scanId) as { progress_json?: string } | undefined;
   const coverage = jsonParse<Record<string, unknown>>(scan?.progress_json, {});
   const stamp = now().replace(/[:.]/g, "-");
-  const outputDir = path.resolve("outputs", `monitor-${safeName(scanId)}-${stamp}`);
+  const outputDir = targetDirectory
+    ? path.resolve(targetDirectory)
+    : path.resolve("outputs", `monitor-${safeName(scanId)}-${stamp}`);
   fs.mkdirSync(outputDir, { recursive: true });
 
-  const base = `海外能源项目监测_${scanId.slice(0, 8)}`;
+  const base = `海外能源项目监测_${scanId.slice(0, 8)}${targetDirectory ? `_${stamp}` : ""}`;
   const xlsxPath = path.join(outputDir, `${base}.xlsx`);
   const mdPath = path.join(outputDir, `${base}.md`);
   const jsonPath = path.join(outputDir, `${base}.json`);
@@ -70,7 +72,10 @@ export async function exportSnapshot(snapshotId: string) {
   const downloads = Object.fromEntries(Object.entries(files).map(([key, filePath]) => [key, {
     name: path.basename(filePath), url: `/api/exports/${exportId}/files/${key}`,
   }]));
-  return { id: exportId, outputDir, files, downloads };
+  const verification = Object.fromEntries(Object.entries(files).map(([key, filePath]) => [key, {
+    path: filePath, exists: fs.existsSync(filePath), size: fs.statSync(filePath).size,
+  }]));
+  return { id: exportId, outputDir, files, downloads, verification, delivery: targetDirectory ? "direct" : "staging" };
 }
 
 async function writeWorkbook(filePath: string, fields: FieldDefinition[], rows: ResultRecord[]) {
@@ -79,8 +84,10 @@ async function writeWorkbook(filePath: string, fields: FieldDefinition[], rows: 
   workbook.created = new Date();
   const sheet = workbook.addWorksheet("项目汇总", { views: [{ state: "frozen", ySplit: 1 }] });
   const bilingual = new Set(fields.filter((field) => rows.some((row) => {
+    if (!isForeignLanguage(row.sourceLanguage)) return false;
     const original = String(row.originalFields?.[field.id] ?? "").trim();
-    return original && original.toLowerCase() !== String(row.fields[field.id] ?? "").trim().toLowerCase();
+    const translated = String(row.fields[field.id] ?? "").trim();
+    return Boolean(original || translated);
   })).map((field) => field.id));
   const columns = fields.flatMap((field) => [
     { label: field.label, field, value: (row: ResultRecord) => row.fields[field.id] ?? null },
@@ -155,7 +162,8 @@ function writeMarkdown(
       const translated = String(row.fields[field.id] ?? "");
       const original = String(row.originalFields?.[field.id] ?? "").trim();
       const unitCheck = String(row.unitChecks?.[field.id] ?? "").trim();
-      return [translated, original && original.toLowerCase() !== translated.trim().toLowerCase() ? `原文：${original}` : "", unitCheck]
+      const bilingual = isForeignLanguage(row.sourceLanguage);
+      return [bilingual ? `中文：${translated || "待补齐"}` : translated, bilingual ? `原文：${original || "待补齐"}` : "", unitCheck]
         .filter(Boolean).join("<br>").replace(/\|/g, "\\|").replace(/\n/g, " ");
     });
     lines.push(`| ${values.join(" | ")} | ${row.primaryUrl} | ${row.score} | ${row.status} |`);
@@ -165,6 +173,10 @@ function writeMarkdown(
     lines.push(`- ${String(row.fields.project_name ?? row.id)}：${row.conflicts.join("；") || "待人工确认"}`);
   }
   return lines.join("\n");
+}
+
+function isForeignLanguage(language?: string) {
+  return Boolean(language && !/^zh(?:-|$)/i.test(language));
 }
 
 function writeEvidenceZip(zipPath: string, scanId: string, rows: ResultRecord[]) {

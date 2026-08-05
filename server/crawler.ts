@@ -85,6 +85,8 @@ function dateFromText(value?: string | null) {
   if (!value) return null;
   const match = value.match(/(20\d{2})[-/.年](\d{1,2})(?:[-/.月](\d{1,2}))?/);
   if (match) return `${match[1]}-${match[2].padStart(2, "0")}-${(match[3] ?? "01").padStart(2, "0")}`;
+  const dayFirst = value.match(/(?:^|\D)(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})(?:\D|$)/);
+  if (dayFirst) return `${dayFirst[3]}-${dayFirst[2].padStart(2, "0")}-${dayFirst[1].padStart(2, "0")}`;
   const parsed = new Date(value);
   return Number.isNaN(parsed.valueOf()) ? null : parsed.toISOString().slice(0, 10);
 }
@@ -515,6 +517,62 @@ export function dateStatusFor(document: Pick<CrawledDocument, "publishedAt" | "d
   return document.publishedAt >= startDate && document.publishedAt <= endDate ? "within_range" : "outside_range";
 }
 
+function articleLikeUrl(value: string) {
+  try {
+    const pathName = new URL(value).pathname;
+    return /\.(?:s?html?|pdf)$|\/details?\/|\/content[_/-]|\/articles?\/|\/news\/|\/20\d{2}[-/]/i.test(pathName);
+  } catch { return false; }
+}
+
+export function documentContentQuality(document: CrawledDocument, requestedUrl = document.url) {
+  const reasons: string[] = [];
+  let score = Math.min(45, Math.round(document.text.length / 180));
+  const body = document.text.replace(/\s+/g, " ").trim();
+  const title = document.title.replace(/\s+/g, " ").trim();
+  const articleShaped = articleLikeUrl(requestedUrl);
+  if (document.error || !body) return { score: 0, reliable: false, reasons: [document.failureCode ?? "EMPTY_BODY"] };
+  if (["article", "document"].includes(document.pageType)) score += 25;
+  if (articleShaped) score += 10;
+  if (document.publishedAt) score += 10;
+  if (ENERGY_TERMS.test(`${title} ${body.slice(0, 12_000)}`)) score += 8;
+  if (PROJECT_TERMS.test(`${title} ${body.slice(0, 12_000)}`)) score += 8;
+  if (body.length < 350) { score -= 35; reasons.push("BODY_TOO_SHORT"); }
+  const genericTitle = /^(?:首页|集团要闻|公司新闻|新闻中心|企业动态|中国.+(?:集团|有限公司)|home|news)$/i.test(title);
+  if (articleShaped && genericTitle) { score -= 30; reasons.push("GENERIC_ARTICLE_TITLE"); }
+  const significantTitle = title.split(/--|[-–—|｜]/)[0].trim();
+  const titleTerms = significantTitle.match(/[\p{L}\p{N}]{4,}/gu)?.filter((term) =>
+    !/集团|有限|公司|project|energy|news|solar|battery|storage|power|wind/i.test(term)) ?? [];
+  const matchedTitleTerms = titleTerms.filter((term) => body.toLowerCase().includes(term.toLowerCase())).length;
+  if (articleShaped && significantTitle.length >= 18 && titleTerms.length >= 2 && matchedTitleTerms / titleTerms.length < 0.34) {
+    score -= 35;
+    reasons.push("TITLE_BODY_MISMATCH");
+  }
+  const shortDateLabels = body.match(/(?:^|\s)\d{1,2}[-/.]\d{1,2}(?=\s|$)/g)?.length ?? 0;
+  if (body.length < 1_400 && shortDateLabels >= 5) { score -= 35; reasons.push("LISTING_BODY"); }
+  return { score: Math.max(0, Math.min(100, score)), reliable: score >= 45 && !reasons.includes("TITLE_BODY_MISMATCH"), reasons };
+}
+
+export function rankDiscoveredUrls(urls: string[], sourceUrl: string, startDate: string, endDate: string) {
+  const source = normalizeUrl(sourceUrl);
+  const score = (value: string) => {
+    let points = 0;
+    const normalized = normalizeUrl(value);
+    if (!normalized) return -1_000;
+    if (normalized === source) points -= 80;
+    if (articleLikeUrl(normalized)) points += 45;
+    if (/project|solar|storage|battery|wind|光伏|储能|风电|中标|签约/i.test(normalized)) points += 22;
+    if (/about|profile|services?|products?|contact|career|data-and-statistics/i.test(normalized)) points -= 30;
+    const date = dateFromText(normalized);
+    if (date && date >= startDate && date <= endDate) points += 60;
+    else if (date) points -= 25;
+    return points;
+  };
+  return [...new Set(urls.map((value) => normalizeUrl(value)).filter(Boolean))]
+    .map((url, index) => ({ url, index, score: score(url) }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map((item) => item.url);
+}
+
 export async function fetchDocument(
   url: string, sourceId: string, discoveryMethod: DiscoveryMethod = "page-link", forceBrowser = false,
 ): Promise<CrawledDocument> {
@@ -712,8 +770,9 @@ export function ruleProjectLikelihood(document: CrawledDocument) {
   try {
     hasListingUrl = /(?:^|\/)(?:archive|category|search|list|page)(?:\/|$)/i.test(new URL(document.url).pathname);
   } catch { /* malformed URLs remain ineligible unless explicitly typed as an article */ }
-  const eligiblePage = ["article", "document"].includes(document.pageType) ||
-    (document.pageType === "unknown" && Boolean(document.publishedAt) && document.text.length >= 350 && !hasListingUrl);
+  const strongUnknown = document.pageType === "unknown" && document.text.length >= 350 && !hasListingUrl &&
+    (Boolean(document.publishedAt) || (articleLikeUrl(document.url) && energy && concrete && capacity));
+  const eligiblePage = ["article", "document"].includes(document.pageType) || strongUnknown;
   return { isProject: eligiblePage && energy && concrete && (capacity || /中标|开工|投产|并网|合同|award|construction|commission/i.test(text)), energy, concrete, capacity, eligiblePage };
 }
 
