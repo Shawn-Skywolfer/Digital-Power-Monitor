@@ -1,0 +1,6 @@
+interface:
+  display_name: "海外能源项目监测"
+  short_description: "诊断、执行并持续迭代海外能源项目的检索、抓取、抽取与证据归档流程"
+  default_prompt: "使用 $scan-overseas-energy-projects 分析扫描证据并执行下一轮检索策略。"
+policy:
+  allow_implicit_invocation: true
