@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "mcp_page_share": 0.2,
+  "max_source_page_share": 0.25,
+  "blocked_status_codes": [401, 403, 429],
+  "retrieval_order": ["rss", "sitemap", "firecrawl-map", "archive", "static", "search", "mcp", "browser-session", "official-alternative"],
+  "safe_auto_adjustments": ["source-page-quota", "per-host-concurrency", "retry-backoff", "candidate-ranking", "fallback-order", "external-content-fallback"],
+  "review_required": ["proxy-or-paid-service", "captcha-or-login", "robots-policy", "date-acceptance", "cost-or-time-budget"],
+  "iteration": {
+    "max_rounds": 3,
+    "stop_after_no_improvement_rounds": 2,
+    "minimum_assessment_coverage": 0.95,
+    "maximum_single_source_share": 0.5
+  }
+}
