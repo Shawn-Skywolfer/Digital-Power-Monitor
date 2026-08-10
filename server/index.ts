@@ -474,18 +474,84 @@ async function runScan(scanId: string, request: ScanRequest) {
       sources: sourceCoverageStates,
     };
   };
+  // ── 流式评估：范围内页面一经抓取立即入队评估、落库 ──
+  // 结果随扫描实时出现在审核页；即使任务中途停止/失败，已完成的评估全部保留，
+  // 不再出现"跑了一小时、中断后 0 结果反馈"（2026-08-10 停滞事故的教训）。
+  const baselineHints = new Map<string, Array<{ fields: Record<string, unknown>; primaryUrl: string }>>();
+  const baselineEvidenceByUrl = new Map<string, ResultRecord>();
+  const assessmentQueue: CrawledDocument[] = [];
+  const assessmentWorkers: Promise<void>[] = [];
+  let sourcesSettled = false;
+  let assessedCount = 0;
+  let pendingAtSettle = 0;
+  const liveResultCount = () =>
+    Number((db.prepare("SELECT COUNT(*) AS count FROM projects WHERE scan_id=?").get(scanId) as { count: number }).count);
   const retainForAssessment = (doc: CrawledDocument) => {
     if (doc.error || !doc.text) return;
+    const retain = (warning?: string) => {
+      if (warning && !doc.warnings.includes(warning)) doc.warnings.push(warning);
+      const already = documents.has(doc.canonicalUrl);
+      documents.set(doc.canonicalUrl, doc);
+      if (!already && !request.referenceRows?.length) assessmentQueue.push(doc);
+    };
     if (doc.dateStatus === "within_range") {
-      documents.set(doc.canonicalUrl, doc);
+      retain();
     } else if (doc.dateStatus === "date_unknown" && !request.referenceRows?.length) {
-      const warning = "发布日期无法确认；若识别为项目，只进入人工审核，不自动通过";
-      if (!doc.warnings.includes(warning)) doc.warnings.push(warning);
-      documents.set(doc.canonicalUrl, doc);
+      retain("发布日期无法确认；若识别为项目，只进入人工审核，不自动通过");
     } else if (doc.dateStatus === "date_conflict" && !request.referenceRows?.length) {
-      const warning = "页面存在多个日期候选；保留进入结构化评估，但结果必须人工复核发布日期";
-      if (!doc.warnings.includes(warning)) doc.warnings.push(warning);
-      documents.set(doc.canonicalUrl, doc);
+      retain("页面存在多个日期候选；保留进入结构化评估，但结果必须人工复核发布日期");
+    }
+  };
+  const assessmentWorker = async () => {
+    while (true) {
+      const doc = assessmentQueue.shift();
+      if (!doc) {
+        if (sourcesSettled) return;
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        continue;
+      }
+      try {
+        await scanControlPoint(scanId);
+      } catch {
+        return; // 停止请求：worker 退出，已完成的评估均已落库
+      }
+      const source = sources.find((item) => item.id === doc.sourceId);
+      try {
+        const analyzed = await assessArticle(doc, fields, provider, request.modelId,
+          baselineHints.get(doc.canonicalUrl) ?? baselineHints.get(normalizeUrl(doc.url) ?? "") ?? []);
+        if (analyzed.modelUsed) modelExtractions++;
+        if (analyzed.error) {
+          doc.warnings.push(`模型判定失败，已使用规则兜底：${analyzed.error}`);
+          addFailure("MODEL_EXTRACTION_ERROR");
+          logScan(scanId, "error", "model", "extraction_failed", `模型抽取失败，规则兜底：${analyzed.error}`, {
+            url: doc.url, title: doc.title, modelId: request.modelId ?? "",
+          });
+        }
+        if (analyzed.assessment.classification === "project_report") projectArticles++;
+        else if (analyzed.assessment.classification === "non_project") nonProjectArticles++;
+        else uncertainArticles++;
+        projectMentions += analyzed.assessment.mentions.length;
+        saveAssessment(scanId, doc, analyzed.assessment, fields, source?.url ?? "", analyzed.modelUsed);
+        assessedCount++;
+        logScan(scanId, analyzed.assessment.classification === "uncertain" ? "warn" : "info", "classification", "article_classified",
+          `${analyzed.assessment.classification}：${doc.title}`, {
+            url: doc.url, confidence: analyzed.assessment.confidence, reasoning: analyzed.assessment.reasoning,
+            mentions: analyzed.assessment.mentions.length, pageType: doc.pageType,
+          });
+        setProgress(scanId, {
+          projectArticles, nonProjectArticles, uncertainArticles, projectMentions, modelExtractions,
+          results: liveResultCount(),
+          // 抓取阶段百分比由来源结算驱动（上限 65）；收尾 drain 阶段按剩余队列推进 65→95
+          ...(sourcesSettled && pendingAtSettle > 0
+            ? { percent: Math.min(95, 65 + Math.round(((pendingAtSettle - assessmentQueue.length) / pendingAtSettle) * 30)) }
+            : {}),
+        });
+      } catch (error) {
+        if (error instanceof ScanStoppedError) return;
+        const message = error instanceof Error ? error.message : String(error);
+        failures++; addFailure("ASSESS_ERROR");
+        logScan(scanId, "error", "classification", "assessment_failed", `页面评估发生未预期错误，已跳过：${message}`, { url: doc.url });
+      }
     }
   };
   markScanActive(scanId, true);
@@ -507,8 +573,6 @@ async function runScan(scanId: string, request: ScanRequest) {
     const firecrawlApiKey = firecrawlKeyFromProfiles(mcpProfiles);
     const genericMcpProfiles = mcpProfiles.filter((profile) => !(firecrawlApiKey && /firecrawl/i.test(profile.name)));
     const recallBaseline = getRecallBaseline(scanId, request);
-    const baselineHints = new Map<string, Array<{ fields: Record<string, unknown>; primaryUrl: string }>>();
-    const baselineEvidenceByUrl = new Map<string, ResultRecord>();
     for (const result of recallBaseline?.results ?? []) {
       if (!["approved", "auto_approved"].includes(result.status)) continue;
       for (const url of [result.primaryUrl, ...result.candidateUrls]) {
@@ -519,6 +583,11 @@ async function runScan(scanId: string, request: ScanRequest) {
         baselineHints.set(normalized, hints);
         if (!baselineEvidenceByUrl.has(normalized)) baselineEvidenceByUrl.set(normalized, result);
       }
+    }
+    // 启动流式评估 worker：配置模型时 2 路并发（LLM 调用为主），纯规则时 1 路（正则评估极快）
+    if (!request.referenceRows?.length) {
+      const workerCount = provider && request.modelId ? 2 : 1;
+      for (let index = 0; index < workerCount; index++) assessmentWorkers.push(assessmentWorker());
     }
     if (recallBaseline) {
       setProgress(scanId, { recall: {
@@ -968,38 +1037,14 @@ async function runScan(scanId: string, request: ScanRequest) {
         insertReferenceResult(scanId, reference, match);
       }
     } else {
-      logScan(scanId, "info", "classification", "started", `开始评估 ${documentList.length} 个范围内页面`, {
-        modelEnabled: Boolean(provider && request.modelId), modelTimeLimitDisabled: true,
-      });
-      for (const doc of documentList) {
-        await scanControlPoint(scanId);
-        const source = sources.find((item) => item.id === doc.sourceId);
-        const analyzed = await assessArticle(doc, fields, provider, request.modelId,
-          baselineHints.get(doc.canonicalUrl) ?? baselineHints.get(normalizeUrl(doc.url) ?? "") ?? []);
-        if (analyzed.modelUsed) modelExtractions++;
-        if (analyzed.error) {
-          doc.warnings.push(`模型判定失败，已使用规则兜底：${analyzed.error}`);
-          addFailure("MODEL_EXTRACTION_ERROR");
-          logScan(scanId, "error", "model", "extraction_failed", `模型抽取失败，规则兜底：${analyzed.error}`, {
-            url: doc.url, title: doc.title, modelId: request.modelId ?? "",
-          });
-        }
-        if (analyzed.assessment.classification === "project_report") projectArticles++;
-        else if (analyzed.assessment.classification === "non_project") nonProjectArticles++;
-        else uncertainArticles++;
-        projectMentions += analyzed.assessment.mentions.length;
-        saveAssessment(scanId, doc, analyzed.assessment, fields, source?.url ?? "", analyzed.modelUsed);
-        logScan(scanId, analyzed.assessment.classification === "uncertain" ? "warn" : "info", "classification", "article_classified",
-          `${analyzed.assessment.classification}：${doc.title}`, {
-            url: doc.url, confidence: analyzed.assessment.confidence, reasoning: analyzed.assessment.reasoning,
-            mentions: analyzed.assessment.mentions.length, pageType: doc.pageType,
-          });
-        setProgress(scanId, {
-          projectArticles, nonProjectArticles, uncertainArticles, projectMentions, modelExtractions,
-          percent: Math.min(95, 65 + Math.round(((projectArticles + nonProjectArticles + uncertainArticles) /
-            Math.max(1, documentList.length)) * 30)),
-        });
+      // 绝大部分页面已在抓取阶段被流式 worker 实时评估；这里只排空剩余队列
+      pendingAtSettle = assessmentQueue.length;
+      sourcesSettled = true;
+      if (pendingAtSettle > 0) {
+        logScan(scanId, "info", "classification", "drain_started",
+          `抓取结束，等待剩余 ${pendingAtSettle} 个已抓页面完成评估（此前已实时完成 ${assessedCount} 个）`);
       }
+      await Promise.all(assessmentWorkers);
     }
     const resultCount = request.referenceRows?.length
       ? Number((db.prepare("SELECT COUNT(*) AS count FROM results WHERE scan_id=?").get(scanId) as { count: number }).count)
@@ -1046,7 +1091,10 @@ async function runScan(scanId: string, request: ScanRequest) {
       audit("scan", scanId, "failed", { message });
     }
   } finally {
+    // 停止/失败路径：让空闲 worker 退出；进行中的 LLM 调用最多再等 5s，超时由 worker 自行收尾落库
+    sourcesSettled = true;
     setIgnoreRobots(false);
+    await Promise.race([Promise.allSettled(assessmentWorkers), new Promise((resolve) => setTimeout(resolve, 5_000))]);
     markScanActive(scanId, false);
   }
 }
@@ -1055,6 +1103,94 @@ function extractMcpUrls(value: unknown) {
   const serialized = typeof value === "string" ? value : JSON.stringify(value ?? "");
   const matches = serialized.match(/https?:\/\/[^\s"'<>}\])]+/gi) ?? [];
   return [...new Set(matches.map((url) => url.replace(/[.,;:]+$/, "")))].slice(0, 500);
+}
+
+/**
+ * 补跑评估：对已完成抓取但缺少评估记录的页面执行结构化评估。
+ * 用于救回中断/失败任务（流式评估上线前的历史任务，或评估 worker 被停止信号打断的尾巴）。
+ * 后台异步执行——历史任务可能有数百个待评页面、大量模型调用，同步 HTTP 等不住。
+ */
+const pendingAssessmentRuns = new Set<string>();
+
+function countPendingAssessment(scanId: string) {
+  return Number((db.prepare(`SELECT COUNT(*) AS count FROM documents d
+    WHERE d.scan_id=? AND d.error IS NULL AND length(d.text) > 0
+      AND d.date_status IN ('within_range','date_unknown','date_conflict')
+      AND NOT EXISTS (SELECT 1 FROM document_assessments a WHERE a.document_id=d.id AND a.scan_id=d.scan_id)`)
+    .get(scanId) as { count: number }).count);
+}
+
+function startPendingAssessment(scanId: string) {
+  const scan = getScan(scanId);
+  if (!scan) throw new Error("监测任务不存在");
+  if (scan.request.referenceRows?.length) throw new Error("参考清单任务不适用补跑评估");
+  if (["queued", "running", "stopping", "paused"].includes(scan.status)) {
+    throw new Error("任务仍在进行中，评估会随抓取实时完成，无需补跑");
+  }
+  const pending = countPendingAssessment(scanId);
+  if (pendingAssessmentRuns.has(scanId)) return { started: false, alreadyRunning: true, pending };
+  if (!pending) return { started: false, alreadyRunning: false, pending: 0 };
+  pendingAssessmentRuns.add(scanId);
+  void runPendingAssessment(scan).finally(() => pendingAssessmentRuns.delete(scanId));
+  return { started: true, alreadyRunning: false, pending };
+}
+
+async function runPendingAssessment(scan: NonNullable<ReturnType<typeof getScan>>) {
+  const scanId = scan.id;
+  const fields = listFields();
+  const provider = getProvider(scan.request.providerId);
+  const rows = db.prepare(`SELECT d.* FROM documents d
+    WHERE d.scan_id=? AND d.error IS NULL AND length(d.text) > 0
+      AND d.date_status IN ('within_range','date_unknown','date_conflict')
+      AND NOT EXISTS (SELECT 1 FROM document_assessments a WHERE a.document_id=d.id AND a.scan_id=d.scan_id)
+    ORDER BY d.rowid`).all(scanId) as Record<string, unknown>[];
+  let assessed = 0;
+  let mentions = 0;
+  let failedCount = 0;
+  logScan(scanId, "info", "classification", "pending_assessment_started",
+    `开始补跑评估：${rows.length} 个已抓页面待评估${provider && scan.request.modelId ? `（模型 ${scan.request.modelId}）` : "（仅规则）"}`);
+  const worker = async () => {
+    while (true) {
+      const row = rows.shift();
+      if (!row) return;
+      const doc = storedDocument(row);
+      try {
+        const sourceRow = db.prepare("SELECT url FROM sources WHERE id=?").get(doc.sourceId) as { url: string } | undefined;
+        const analyzed = await assessArticle(doc, fields, provider, scan.request.modelId);
+        saveAssessment(scanId, doc, analyzed.assessment, fields, sourceRow?.url ?? "", analyzed.modelUsed);
+        assessed++;
+        if (analyzed.assessment.classification === "project_report") mentions += analyzed.assessment.mentions.length;
+        logScan(scanId, analyzed.assessment.classification === "uncertain" ? "warn" : "info", "classification", "article_classified",
+          `补跑评估 ${analyzed.assessment.classification}：${doc.title}`, { url: doc.url, mentions: analyzed.assessment.mentions.length });
+        if (assessed % 10 === 0) {
+          setProgress(scanId, { results: Number((db.prepare("SELECT COUNT(*) AS count FROM projects WHERE scan_id=?")
+            .get(scanId) as { count: number }).count) });
+        }
+      } catch (error) {
+        failedCount++;
+        logScan(scanId, "error", "classification", "assessment_failed",
+          `补跑评估失败，已跳过：${error instanceof Error ? error.message : String(error)}`, { url: doc.url });
+      }
+    }
+  };
+  const workerCount = provider && scan.request.modelId ? 2 : 1;
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  // 重算评估与结果计数，让进度和审核页反映补跑后的真实状态
+  const counts = db.prepare("SELECT classification, COUNT(*) AS count FROM document_assessments WHERE scan_id=? GROUP BY classification")
+    .all(scanId) as { classification: string; count: number }[];
+  const byClassification = Object.fromEntries(counts.map((row) => [row.classification, Number(row.count)]));
+  const mentionTotal = Number((db.prepare("SELECT COALESCE(SUM(mention_count),0) AS total FROM document_assessments WHERE scan_id=?")
+    .get(scanId) as { total: number }).total);
+  const resultCount = Number((db.prepare("SELECT COUNT(*) AS count FROM projects WHERE scan_id=?").get(scanId) as { count: number }).count);
+  setProgress(scanId, {
+    projectArticles: byClassification.project_report ?? 0,
+    nonProjectArticles: byClassification.non_project ?? 0,
+    uncertainArticles: byClassification.uncertain ?? 0,
+    projectMentions: mentionTotal, results: resultCount,
+  });
+  logScan(scanId, "info", "classification", "pending_assessed",
+    `补跑评估完成：新评估 ${assessed} 个页面，识别项目线索 ${mentions} 个${failedCount ? `，失败 ${failedCount} 个` : ""}`);
+  audit("scan", scanId, "pending_assessed", { assessed, mentions, failed: failedCount });
 }
 
 function saveDocument(scanId: string, doc: CrawledDocument) {
@@ -1594,6 +1730,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (req.method === "POST" && scanControl) return sendJson(res, 200, controlScan(
       scanControl[1], scanControl[2] as "pause" | "resume" | "stop",
     ));
+    const scanAssessPending = url.pathname.match(/^\/api\/scans\/([^/]+)\/assess-pending$/);
+    if (req.method === "POST" && scanAssessPending) return sendJson(res, 202, startPendingAssessment(scanAssessPending[1]));
 
     const deepMatch = url.pathname.match(/^\/api\/results\/([^/]+)\/deep-expand$/);
     if (req.method === "POST" && deepMatch) return sendJson(res, 200, await deepExpand(deepMatch[1], body));
