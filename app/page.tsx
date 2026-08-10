@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8765";
 
-type View = "dashboard" | "new-scan" | "results" | "sources" | "models" | "search" | "mcp" | "skills" | "exports";
+type View = "dashboard" | "new-scan" | "results" | "sources" | "models" | "search" | "mcp" | "browser" | "skills" | "exports";
 type Json = Record<string, unknown>;
 type Field = { id: string; label: string; type: string; unit?: string; required: boolean; position: number };
 type Source = { id: string; name: string; type: string; coverage: string; url: string; enabled: boolean };
@@ -21,6 +21,11 @@ type McpTestResult = {
   ok: boolean; status: string; latencyMs: number; error?: string; diagnosis?: string;
   catalog?: { runtime?: string; tools?: unknown[]; resources?: unknown[]; prompts?: unknown[]; warnings?: string[] };
 };
+type BrowserRendering = {
+  enabled: boolean; endpoint: string; backendOrder: string[]; connectTimeoutMs: number;
+  hasToken: boolean; source: "db" | "env" | "none"; envEndpoint: boolean;
+};
+type BrowserProbe = { ok: boolean; latencyMs: number; endpoint?: string; version?: string; error?: string; diagnosis?: string };
 type Scan = { id: string; status: string; progress: Record<string, unknown>; createdAt: string; request?: Json; error?: string };
 type Result = {
   id: string; fields: Record<string, unknown>; primaryUrl: string; candidateUrls: string[];
@@ -67,6 +72,7 @@ const nav: { id: View; label: string; icon: string; group?: string }[] = [
   { id: "models", label: "大模型", icon: "◇" },
   { id: "search", label: "搜索 API", icon: "⌕" },
   { id: "mcp", label: "MCP", icon: "⬡" },
+  { id: "browser", label: "浏览器渲染", icon: "▣" },
   { id: "skills", label: "Skill 策略", icon: "✦" },
 ];
 
@@ -249,6 +255,7 @@ export default function Home() {
           {view === "models" && <ModelsView providers={providers} refresh={refresh} notify={notify} onError={setError} />}
           {view === "search" && <SearchView providers={searchProviders} refresh={refresh} notify={notify} onError={setError} />}
           {view === "mcp" && <McpView servers={mcpServers} refresh={refresh} notify={notify} onError={setError} />}
+          {view === "browser" && <BrowserView notify={notify} onError={setError} />}
           {view === "skills" && <SkillView scans={scans} activeScanId={activeScanId} notify={notify} onError={setError} />}
           {view === "exports" && <ExportsView activeScan={activeScan} results={results} fields={fields} notify={notify} onError={setError} />}
         </div>
@@ -261,7 +268,7 @@ function pageTitle(view: View) {
   const titles: Record<View, string> = {
     dashboard: "今天要监测什么？", "new-scan": "配置一次新的监测",
     results: "逐条核验监测结果", sources: "维护监测来源", models: "配置大模型能力",
-    search: "配置外部搜索能力", mcp: "连接 MCP 工具与资源", skills: "加载并迭代检索 Skill", exports: "确认版本并导出",
+    search: "配置外部搜索能力", mcp: "连接 MCP 工具与资源", browser: "配置浏览器渲染兜底", skills: "加载并迭代检索 Skill", exports: "确认版本并导出",
   };
   return titles[view];
 }
@@ -646,6 +653,18 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
 function SourcesView({ sources, refresh, notify, onError }: { sources: Source[]; refresh: () => Promise<void>; notify: (message: string) => void; onError: (message: string) => void }) {
   const blankSource = { id: "", name: "", url: "", coverage: "", type: "网址", enabled: true };
   const [form, setForm] = useState(blankSource);
+  const [checks, setChecks] = useState<Record<string, Json>>({});
+  const [checking, setChecking] = useState<Record<string, boolean>>({});
+  async function check(source: Source) {
+    setChecking((current) => ({ ...current, [source.id]: true }));
+    setChecks((current) => { const next = { ...current }; delete next[source.id]; return next; });
+    try {
+      const result = await api<Json>(`/api/sources/${source.id}/check`, { method: "POST", body: "{}" });
+      setChecks((current) => ({ ...current, [source.id]: result }));
+      if (result.ok) notify(`「${source.name}」体检通过`);
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setChecking((current) => ({ ...current, [source.id]: false })); }
+  }
   async function upload(file?: File) {
     if (!file) return;
     try {
@@ -670,7 +689,7 @@ function SourcesView({ sources, refresh, notify, onError }: { sources: Source[];
     <div className="two-col settings-cols">
       <section className="panel">
         <PanelHeader title="来源库" subtitle={`${sources.length} 个可监测站点`} />
-        <div className="settings-list">{sources.map((source) => <div className="settings-row" key={source.id}><span className="source-logo">{source.name.slice(0,1)}</span><div><strong>{source.name}</strong><p>{source.url}</p>{source.coverage && <small>{source.coverage}</small>}</div><StatusPill status={source.enabled ? "approved" : "rejected"} /><div className="row-actions"><button className="ghost small" onClick={() => edit(source)}>编辑</button><button className="danger-ghost small" onClick={() => void remove(source)}>删除</button></div></div>)}</div>
+        <div className="settings-list">{sources.map((source) => <div key={source.id}><div className="settings-row"><span className="source-logo">{source.name.slice(0,1)}</span><div><strong>{source.name}</strong><p>{source.url}</p>{source.coverage && <small>{source.coverage}</small>}</div><StatusPill status={source.enabled ? "approved" : "rejected"} /><div className="row-actions"><button className="ghost small" disabled={Boolean(checking[source.id])} onClick={() => void check(source)}>{checking[source.id] ? "体检中…" : "体检"}</button><button className="ghost small" onClick={() => edit(source)}>编辑</button><button className="danger-ghost small" onClick={() => void remove(source)}>删除</button></div></div>{checks[source.id] && <pre className="test-result">{JSON.stringify(checks[source.id], null, 2)}</pre>}</div>)}</div>
       </section>
       <section className="stack">
         <div className="panel form-card">
@@ -822,6 +841,111 @@ function SearchView({ providers, refresh, notify, onError }: { providers: Search
       <section className="panel">
         <PanelHeader title="已配置的搜索能力" subtitle="检测延迟、额度和结果映射" />
         <div className="settings-list">{providers.map((provider) => <div key={provider.id}><div className="settings-row"><span className="source-logo">S</span><div><strong>{provider.name}</strong><p>{provider.kind} · {provider.endpoint}</p></div><button className="ghost small" onClick={() => void test(provider.id)}>测试搜索</button></div>{tests[provider.id] && <pre className="test-result">{JSON.stringify(tests[provider.id], null, 2)}</pre>}</div>)}{!providers.length && <Empty text="还没有搜索 API。" />}</div>
+      </section>
+    </div>
+  );
+}
+
+function BrowserView({ notify, onError }: { notify: (message: string) => void; onError: (message: string) => void }) {
+  const blankForm = { enabled: false, mode: "cloud", endpoint: "", region: "euwest", country: "", token: "", order: "local-first", connectTimeoutMs: 8000, clearToken: false };
+  const [form, setForm] = useState(blankForm);
+  const [current, setCurrent] = useState<BrowserRendering | null>(null);
+  const [probe, setProbe] = useState<BrowserProbe | null>(null);
+  const [testing, setTesting] = useState(false);
+
+  function composeEndpoint(values = form) {
+    if (values.mode === "cloud") {
+      const base = `wss://${values.region}.cloud.lightpanda.io/ws`;
+      const params = new URLSearchParams();
+      if (values.country.trim()) { params.set("proxy", "datacenter"); params.set("country", values.country.trim().toLowerCase()); }
+      const query = params.toString();
+      return query ? `${base}?${query}` : base;
+    }
+    return values.endpoint.trim();
+  }
+
+  async function load() {
+    try {
+      const config = await api<BrowserRendering>("/api/browser-rendering");
+      setCurrent(config);
+      const endpoint = config.endpoint ?? "";
+      const cloud = /cloud\.lightpanda\.io/i.test(endpoint);
+      let region = "euwest"; let country = "";
+      try {
+        const parsed = new URL(endpoint.replace(/^ws/i, "http"));
+        const hostRegion = parsed.hostname.split(".")[0];
+        if (/^(euwest|uswest)$/i.test(hostRegion)) region = hostRegion.toLowerCase();
+        country = parsed.searchParams.get("country") ?? "";
+      } catch { /* 端点为空或不可解析时保留默认 */ }
+      setForm((previous) => ({
+        ...previous, enabled: config.enabled, mode: cloud ? "cloud" : "local",
+        endpoint: cloud ? "" : endpoint, region, country,
+        order: config.backendOrder[0] === "lightpanda" ? "lightpanda-first" : "local-first",
+        connectTimeoutMs: config.connectTimeoutMs || 8000, token: "", clearToken: false,
+      }));
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+  useEffect(() => { void load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function save() {
+    try {
+      await api("/api/browser-rendering", {
+        method: "POST",
+        body: JSON.stringify({
+          enabled: form.enabled, endpoint: composeEndpoint(),
+          backendOrder: form.order === "lightpanda-first" ? ["lightpanda", "local"] : ["local", "lightpanda"],
+          connectTimeoutMs: Number(form.connectTimeoutMs) || 8000,
+          ...(form.token.trim() ? { token: form.token.trim() } : {}),
+          ...(form.clearToken ? { clearToken: true } : {}),
+        }),
+      });
+      notify("浏览器渲染配置已保存"); setProbe(null); await load();
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+
+  async function test() {
+    setTesting(true); setProbe(null);
+    try {
+      const result = await api<BrowserProbe>("/api/browser-rendering/test", {
+        method: "POST",
+        body: JSON.stringify({ endpoint: composeEndpoint(), ...(form.token.trim() ? { token: form.token.trim() } : {}) }),
+      });
+      setProbe(result);
+      if (result.ok) notify("Lightpanda 连接测试通过");
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setTesting(false); }
+  }
+
+  const sourceLabel = current?.source === "db" ? "设置页保存" : current?.source === "env" ? "环境变量" : "未配置";
+  return (
+    <div className="two-col settings-cols">
+      <section className="panel form-card">
+        <h2>Lightpanda 渲染后端</h2>
+        <p>MCP 或 Firecrawl 失效、本机 Chrome/Edge 被拦截时，用 Lightpanda 无头浏览器完整加载 JS 页面。Beta 阶段，复杂站点可能渲染不全，默认排在本机浏览器之后。</p>
+        <label><span>启用 Lightpanda</span><select value={form.enabled ? "yes" : "no"} onChange={(e) => setForm({ ...form, enabled: e.target.value === "yes" })}><option value="no">停用（只用本机 Chrome/Edge）</option><option value="yes">启用（接入渲染兜底链）</option></select></label>
+        <label><span>部署方式</span><select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value })}><option value="cloud">Lightpanda Cloud（托管，数据经第三方）</option><option value="local">本机 / 自托管（WSL2 · Docker）</option></select></label>
+        {form.mode === "cloud" ? <>
+          <label><span>区域</span><select value={form.region} onChange={(e) => setForm({ ...form, region: e.target.value })}><option value="euwest">西欧 euwest</option><option value="uswest">美西 uswest</option></select></label>
+          <label><span>代理国家代码（可选，如 de / us）</span><input value={form.country} onChange={(e) => setForm({ ...form, country: e.target.value })} placeholder="留空使用共享数据中心 IP" /></label>
+          <label><span>Cloud Token（留空保留已保存密钥）</span><input type="password" value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })} placeholder={current?.hasToken ? "已保存，留空保持不变" : "lightpanda.io 控制台获取"} /></label>
+          {current?.hasToken && <label><span>清除已保存 Token</span><select value={form.clearToken ? "yes" : "no"} onChange={(e) => setForm({ ...form, clearToken: e.target.value === "yes" })}><option value="no">保留</option><option value="yes">保存时清除</option></select></label>}
+        </> : <>
+          <label><span>CDP 端点</span><input value={form.endpoint} onChange={(e) => setForm({ ...form, endpoint: e.target.value })} placeholder="ws://127.0.0.1:9222" /></label>
+          <label><span>访问 Token（可选，留空保留）</span><input type="password" value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })} /></label>
+        </>}
+        <label><span>渲染后端顺序</span><select value={form.order} onChange={(e) => setForm({ ...form, order: e.target.value })}><option value="local-first">本机 Chrome/Edge 优先（兼容性更好）</option><option value="lightpanda-first">Lightpanda 优先（更轻更快）</option></select></label>
+        <label><span>连接超时（毫秒）</span><input type="number" value={form.connectTimeoutMs} onChange={(e) => setForm({ ...form, connectTimeoutMs: Number(e.target.value) })} /></label>
+        <button className="primary full" onClick={() => void save()}>保存渲染配置</button>
+      </section>
+      <section className="panel">
+        <PanelHeader title="当前状态" subtitle="配置来源与连通性检测" />
+        <div className="settings-list">
+          <div className="settings-row"><span className="source-logo">▣</span><div><strong>{current?.enabled ? "已启用" : current ? "未启用" : "读取中…"}</strong><p>{current?.endpoint || "未配置端点"}</p></div></div>
+          <div className="settings-row"><span className="source-logo">⇄</span><div><strong>兜底顺序</strong><p>{current ? current.backendOrder.map((item) => item === "local" ? "本机浏览器" : "Lightpanda").join(" → ") : "…"}</p></div></div>
+          <div className="settings-row"><span className="source-logo">⚿</span><div><strong>Token</strong><p>{current?.hasToken ? "已加密保存（DPAPI）" : "未保存"} · 配置来源：{sourceLabel}</p></div></div>
+        </div>
+        <button className="ghost small" disabled={testing} onClick={() => void test()}>{testing ? "正在连接…" : "测试连接"}</button>
+        {probe && <pre className="test-result">{JSON.stringify(probe, null, 2)}</pre>}
       </section>
     </div>
   );

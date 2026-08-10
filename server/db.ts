@@ -118,6 +118,13 @@ const schema = [
     id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
     action TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS browser_rendering (
+    id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,
+    endpoint TEXT NOT NULL DEFAULT '',
+    backend_order_json TEXT NOT NULL DEFAULT '["local","lightpanda"]',
+    connect_timeout_ms INTEGER NOT NULL DEFAULT 8000,
+    updated_at TEXT NOT NULL
+  )`,
 ];
 for (const statement of schema) db.exec(statement);
 db.exec("CREATE INDEX IF NOT EXISTS idx_skill_iterations_skill_created ON skill_iterations(skill_id,created_at DESC)");

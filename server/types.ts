@@ -30,6 +30,20 @@ export interface SearchProviderRecord {
   hasSecret?: boolean;
 }
 
+export type RenderBackend = "local" | "lightpanda";
+
+export interface BrowserRenderingRecord {
+  enabled: boolean;
+  /** ws:// 或 wss:// 的 CDP 端点（cloud token 拼接后可能带 query） */
+  endpoint: string;
+  backendOrder: RenderBackend[];
+  connectTimeoutMs: number;
+  /** vault 中是否存在 cloud token；接口只回此标记，永不回 token 本体 */
+  hasToken?: boolean;
+  /** 配置来源：db 设置行 / 环境变量 / 未配置 */
+  source?: "db" | "env" | "none";
+}
+
 export interface FieldDefinition {
   id: string;
   label: string;

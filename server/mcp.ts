@@ -206,14 +206,24 @@ function stdioSession(profile: McpProfile) {
 
 function resolveStdioCommand(command: string, args: string[]) {
   if (/^npx(?:\.cmd)?$/i.test(command)) {
-    const pnpmEntry = path.resolve(path.dirname(process.execPath), "..", "node_modules", "pnpm", "bin", "pnpm.mjs");
+    const nodeDir = path.dirname(process.execPath);
+    const pnpmEntry = path.resolve(nodeDir, "..", "node_modules", "pnpm", "bin", "pnpm.mjs");
     if (fs.existsSync(pnpmEntry)) return {
       command: process.execPath, args: [pnpmEntry, "dlx", ...args.filter((arg) => !["-y", "--yes"].includes(arg))],
       label: "内置 pnpm dlx（兼容 npx 配置）",
     };
+    // Windows 下 spawn 无法直接执行 npx.cmd / npx.ps1（CreateProcess 找不到 npx.exe），
+    // 改走 Node 自带 npm 的 npx-cli.js，等价于 npx 但可用 node 直接拉起
+    const npxCli = path.resolve(nodeDir, "node_modules", "npm", "bin", "npx-cli.js");
+    if (fs.existsSync(npxCli)) return {
+      command: process.execPath, args: [npxCli, ...args],
+      label: "内置 npm npx（兼容 npx 配置）",
+    };
   }
   return { command, args, label: `${command} ${args.join(" ")}`.trim() };
 }
+
+export { resolveStdioCommand };
 
 function buildToolArgs(schema: JsonObject, context: JsonObject) {
   const properties = (schema.properties ?? {}) as Record<string, JsonObject>;
