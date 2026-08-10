@@ -11,7 +11,8 @@ import type {
 } from "./types";
 import { listProviderModels, searchWeb, testProvider } from "./providers";
 import {
-  dateStatusFor, discoverSourcePages, documentContentQuality, fetchDocument, normalizeUrl, rankDiscoveredUrls,
+  dateStatusFor, discoverSourcePages, documentContentQuality, failedDocument, fetchDocument, normalizeUrl,
+  rankDiscoveredUrls, setIgnoreRobots,
 } from "./crawler";
 import { applyBilingualRepair, assessArticle, mapProject, saveAssessment } from "./projects";
 import {
@@ -400,11 +401,17 @@ function normalizeScanRequest(payload: JsonObject): ScanRequest {
     mcpServerIds: Array.isArray(payload.mcpServerIds) ? payload.mcpServerIds.map(String) : [],
     mcpToolNames: Array.isArray(payload.mcpToolNames) ? payload.mcpToolNames.map(String) : [],
     budget,
+    ignoreRobots: payload.ignoreRobots === true,
     referenceRows: Array.isArray(payload.referenceRows) ? payload.referenceRows as Record<string, unknown>[] : undefined,
   };
 }
 
 async function runScan(scanId: string, request: ScanRequest) {
+  setIgnoreRobots(request.ignoreRobots === true);
+  if (request.ignoreRobots) {
+    logScan(scanId, "warn", "lifecycle", "robots_ignored",
+      "已按任务设置忽略 robots.txt 抓取限制，改用浏览器模拟真人访问公开页面（个人研究用途）");
+  }
   const fields = listFields();
   const sourceCatalog = new Map(listSources().map((source) => [source.id, source]));
   const sources = request.sourceIds.map((id) => sourceCatalog.get(id)).filter((source): source is SourceRecord => Boolean(source));
@@ -695,6 +702,30 @@ async function runScan(scanId: string, request: ScanRequest) {
       try { return await fetchWithFallback(...args); }
       finally { activeSourceFetches--; fetched++; }
     };
+    // 页级看门狗：任何单页处理（静态抓取→浏览器渲染→解析）不得超过上限。
+    // 2026-08-10 事故：某站点页面让渲染永久挂起，整个扫描停滞 1.8 小时且停止请求无法生效。
+    // 超时按失败跳过该页；底层挂起的 Promise 不再可信，但不做任何数据库写入，扫描继续。
+    const pageWatchdogMs = Number(process.env.DPM_PAGE_WATCHDOG_MS) || 240_000;
+    const fetchWithWatchdog = async (...args: Parameters<typeof fetchDocument>): Promise<CrawledDocument | undefined> => {
+      const [pageUrl, pageSourceId, pageMethod] = args;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          fetchWithinBudget(...args),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("页面处理看门狗超时")), pageWatchdogMs);
+          }),
+        ]);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/看门狗/.test(message)) throw error;
+        return failedDocument(pageUrl, pageSourceId,
+          `页面处理超过 ${Math.round(pageWatchdogMs / 1000)}s 未完成（可能遭遇反爬挂起或浏览器卡死），已跳过该页`,
+          pageMethod ?? "page-link", "WATCHDOG_TIMEOUT");
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
     const processSource = async (sourceIndex: number) => {
       await scanControlPoint(scanId);
       const source = sources[sourceIndex];
@@ -764,7 +795,7 @@ async function runScan(scanId: string, request: ScanRequest) {
         fetchedUrls.add(normalized);
         db.prepare("UPDATE crawl_queue SET status='in_progress',attempts=attempts+1,updated_at=? WHERE scan_id=? AND url=?")
           .run(now(), scanId, page.url);
-        const doc = await fetchWithinBudget(page.url, source.id, page.method, /dynamic|spa|javascript/i.test(source.type));
+        const doc = await fetchWithWatchdog(page.url, source.id, page.method, /dynamic|spa|javascript/i.test(source.type));
         if (!doc) break;
         doc.dateStatus = dateStatusFor(doc, request.startDate, request.endDate);
         if (doc.error) {
@@ -829,7 +860,7 @@ async function runScan(scanId: string, request: ScanRequest) {
               const normalized = normalizeUrl(hit.url);
               if (!normalized || fetchedUrls.has(normalized)) continue;
               fetchedUrls.add(normalized); discovered++;
-              const doc = await fetchWithinBudget(hit.url, source.id, "search");
+              const doc = await fetchWithWatchdog(hit.url, source.id, "search");
               if (!doc) break;
               fetchedForSource++;
               doc.dateStatus = dateStatusFor(doc, request.startDate, request.endDate);
@@ -1015,6 +1046,7 @@ async function runScan(scanId: string, request: ScanRequest) {
       audit("scan", scanId, "failed", { message });
     }
   } finally {
+    setIgnoreRobots(false);
     markScanActive(scanId, false);
   }
 }
@@ -1874,11 +1906,24 @@ function delay(ms: number) { return new Promise((resolve) => setTimeout(resolve,
 function escapeRegex(value: string) { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
 migrateLegacyMcpConfigurations();
+recoverInterruptedScans();
 const server = http.createServer((req, res) => { void route(req, res); });
 server.listen(PORT, HOST, () => {
   console.log(`Digital Power Monitor API: http://${HOST}:${PORT}`);
   console.log(`MCP endpoint: http://${HOST}:${PORT}/mcp`);
 });
+
+/** 进程重启后，上次运行中的扫描已无执行者，永远等不到推进——直接标记为中断，避免界面卡在"运行中/停止中" */
+function recoverInterruptedScans() {
+  const stale = db.prepare("SELECT id FROM scans WHERE status IN ('running','stopping','paused')").all() as { id: string }[];
+  for (const scan of stale) {
+    db.prepare("UPDATE scans SET status='stopped', error=?, updated_at=? WHERE id=?")
+      .run("服务进程重启，扫描已中断；已完成的数据和日志均已保留", now(), scan.id);
+    db.prepare("UPDATE crawl_queue SET status='failed', last_error=?, updated_at=? WHERE scan_id=? AND status='in_progress'")
+      .run("服务进程重启，页面抓取已中断", now(), scan.id);
+    logScan(scan.id, "warn", "lifecycle", "interrupted", "服务进程重启，扫描已中断；可重新发起监测任务");
+  }
+}
 
 function shutdown() {
   server.close(() => process.exit(0));

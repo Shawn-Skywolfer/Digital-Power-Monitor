@@ -9,7 +9,7 @@ import type {
   JsonObject, RenderBackend, SourceRecord,
 } from "./types";
 import { DATA_DIR } from "./db";
-import { closeLightpanda, renderWithLightpanda, resolveLightpandaConfig, retireLightpandaContext } from "./lightpanda";
+import { closeLightpanda, renderWithLightpanda, resetLightpanda, resolveLightpandaConfig, retireLightpandaContext } from "./lightpanda";
 
 const USER_AGENT = process.env.DPM_USER_AGENT ??
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -22,6 +22,30 @@ const PROJECT_TERMS = /项目|电站|电场|园区|基地|中标|开工|投产|�
 let browserPromise: Promise<Browser> | null = null;
 const browserContexts = new Map<string, Promise<BrowserContext>>();
 const robotsCache = new Map<string, { expiresAt: number; sitemapUrls: string[]; disallowed: string[] }>();
+
+// robots.txt 策略：扫描请求可声明 ignoreRobots（个人研究用途、仅访问公开页面），
+// 由 runScan 在任务期间调用 setIgnoreRobots 设置；默认遵守。
+let ignoreRobots = false;
+export function setIgnoreRobots(ignore: boolean) { ignoreRobots = ignore; }
+
+// 渲染看门狗：页面 JS 死循环或浏览器卡死时，goto/content 可能永不返回。
+// 任何后端的一次渲染尝试不得超过该上限，超时后销毁对应浏览器，保证扫描不被永久挂起。
+let renderWatchdogMs = Number(process.env.DPM_RENDER_WATCHDOG_MS) || 75_000;
+export function __setRenderWatchdogForTests(ms: number | null) {
+  renderWatchdogMs = ms ?? (Number(process.env.DPM_RENDER_WATCHDOG_MS) || 75_000);
+}
+
+// 渲染熔断：同一 origin 连续渲染失败（含看门狗超时）达到阈值后，冷却期内不再尝试渲染，
+// 避免反爬站点让每一页都白付一次看门狗超时代价（回退为纯静态抓取，扫描继续推进）
+const renderCircuit = new Map<string, { failures: number; openUntil: number }>();
+const RENDER_CIRCUIT_THRESHOLD = 2;
+const RENDER_CIRCUIT_COOLDOWN_MS = 10 * 60_000;
+export function __resetRenderCircuitForTests() { renderCircuit.clear(); }
+
+function renderCircuitOpen(origin: string) {
+  const state = renderCircuit.get(origin);
+  return Boolean(state && state.failures >= RENDER_CIRCUIT_THRESHOLD && state.openUntil > Date.now());
+}
 
 const BLOCK_PATTERNS: Array<{ code: string; pattern: RegExp }> = [
   { code: "BOT_CHALLENGE", pattern: /captcha|verify (?:that )?you are human|checking your browser|just a moment|cloudflare|人机验证|验证码|安全验证/i },
@@ -79,6 +103,7 @@ async function readRobots(target: URL) {
 }
 
 async function robotsAllowed(target: URL) {
+  if (ignoreRobots) return true;
   const { disallowed } = await readRobots(target);
   return !disallowed.some((item) => target.pathname.startsWith(item));
 }
@@ -189,6 +214,8 @@ async function getBrowser() {
       const proxyServer = process.env.DPM_BROWSER_PROXY ?? process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY;
       return chromium.launch({
         executablePath, headless: true,
+        // 关闭自动化特征，避免站点依据 navigator.webdriver 等指纹拦截无头浏览器
+        args: ["--disable-blink-features=AutomationControlled"],
         ...(proxyServer ? { proxy: { server: proxyServer } } : {}),
       });
     })();
@@ -200,12 +227,18 @@ async function getBrowser() {
 export async function closeCrawlerBrowser() {
   const contexts = [...browserContexts.values()];
   browserContexts.clear();
-  await Promise.allSettled(contexts.map(async (context) => (await context).close()));
   const current = browserPromise;
   browserPromise = null;
-  if (current) {
-    try { await (await current).close(); } catch { /* browser may already be unavailable */ }
-  }
+  await Promise.race([
+    (async () => {
+      await Promise.allSettled(contexts.map(async (context) => (await context).close()));
+      if (current) {
+        try { await (await current).close(); } catch { /* browser may already be unavailable */ }
+      }
+    })(),
+    // 浏览器卡死时 close() 永不返回，关停不应被拖住；句柄由进程退出或看门狗的 kill 兜底
+    new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
+  ]);
   await closeLightpanda();
 }
 
@@ -213,13 +246,22 @@ async function getBrowserContext(url: string) {
   const origin = new URL(url).origin;
   let context = browserContexts.get(origin);
   if (!context) {
-    context = getBrowser().then((browser) => browser.newContext({
-      userAgent: USER_AGENT,
-      locale: "zh-CN",
-      timezoneId: "Asia/Shanghai",
-      viewport: { width: 1440, height: 900 },
-      extraHTTPHeaders: { "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
-    }));
+    context = getBrowser().then(async (browser) => {
+      const created = await browser.newContext({
+        userAgent: USER_AGENT,
+        locale: "zh-CN",
+        timezoneId: "Asia/Shanghai",
+        viewport: { width: 1440, height: 900 },
+        extraHTTPHeaders: { "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
+      });
+      // 抹除常见无头指纹：webdriver 标记、空插件列表、单一语言
+      await created.addInitScript(() => {
+        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+        Object.defineProperty(navigator, "languages", { get: () => ["zh-CN", "zh", "en"] });
+        Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3] });
+      }).catch(() => undefined);
+      return created;
+    });
     context.catch(() => browserContexts.delete(origin));
     browserContexts.set(origin, context);
   }
@@ -271,17 +313,59 @@ function renderWithBackend(url: string, backend: RenderBackend): Promise<Rendere
 
 /** 按配置顺序依次尝试渲染后端；Lightpanda 未启用时链退化为 ["local"]，行为与改造前一致 */
 async function renderHtml(url: string): Promise<RenderedPage> {
+  const origin = new URL(url).origin;
+  if (renderCircuitOpen(origin)) throw new Error("该站点连续渲染失败，渲染熔断中（已回退静态抓取）");
   const config = resolveLightpandaConfig();
   const order = config.backendOrder.filter((backend) => backend !== "lightpanda" || config.enabled);
   const errors: string[] = [];
   for (const backend of order.length ? order : (["local"] as RenderBackend[])) {
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await renderWithBackend(url, backend);
+      // 渲染看门狗：页面 JS 死循环 / 浏览器进程卡死会让 goto、content() 永不返回，
+      // 超时后销毁对应后端实例并抛错，保证扫描不会被单个页面永久挂起
+      const rendered = await Promise.race([
+        renderWithBackend(url, backend),
+        new Promise<never>((_, reject) => {
+          watchdog = setTimeout(() => reject(new Error(`渲染看门狗超时（${Math.round(renderWatchdogMs / 1000)}s）`)), renderWatchdogMs);
+        }),
+      ]);
+      renderCircuit.delete(origin);
+      return rendered;
     } catch (error) {
-      errors.push(`${backend === "lightpanda" ? "Lightpanda" : "本机浏览器"}：${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      if (/看门狗/.test(message)) {
+        // 渲染已卡死：该后端的浏览器/连接不再可信，整体销毁，避免后续页面继续挂在同一实例上
+        if (backend === "lightpanda") await resetLightpanda().catch(() => undefined);
+        else await nukeLocalBrowser().catch(() => undefined);
+      }
+      errors.push(`${backend === "lightpanda" ? "Lightpanda" : "本机浏览器"}：${message}`);
+    } finally {
+      if (watchdog) clearTimeout(watchdog);
     }
   }
+  const state = renderCircuit.get(origin) ?? { failures: 0, openUntil: 0 };
+  state.failures++;
+  if (state.failures >= RENDER_CIRCUIT_THRESHOLD) state.openUntil = Date.now() + RENDER_CIRCUIT_COOLDOWN_MS;
+  renderCircuit.set(origin, state);
   throw new Error(errors.join("；") || "没有可用的渲染后端");
+}
+
+/** 看门狗超时后销毁本机浏览器：页面操作可能已卡死，直接杀死整个浏览器进程树，下次渲染重新拉起。
+ *  注意不能用 browser.close()：浏览器卡死时 CDP 无响应，close() 自身也会挂起（2026-08-10 明阳页面事故）。 */
+async function nukeLocalBrowser() {
+  const contexts = [...browserContexts.values()];
+  browserContexts.clear();
+  const current = browserPromise;
+  browserPromise = null;
+  for (const context of contexts) context.then((item) => item.close().catch(() => undefined)).catch(() => undefined);
+  if (current) {
+    current.then((browser) => {
+      // playwright-core 的 Browser 类型未暴露 process()，但 launch() 出的实例运行时可取到子进程
+      const proc = (browser as unknown as { process?: () => { kill: (signal?: string) => void } | null }).process?.();
+      try { proc?.kill("SIGKILL"); } catch { /* 进程可能已退出 */ }
+      browser.close().catch(() => undefined);
+    }).catch(() => undefined);
+  }
 }
 
 export function detectAccessBlock(statusCode: number, title: string, text: string) {
@@ -715,7 +799,9 @@ export async function fetchDocument(
     const warnings: string[] = [];
     if (contentType.includes("html") || contentType.includes("text")) {
       const staticHtml = bytes.toString("utf8");
-      if (needsBrowser(staticHtml, forceBrowser || [401, 403, 429].includes(response.status))) {
+      // 静态响应命中反爬挑战/拒绝特征（含 200 伪装的验证页）时，直接转浏览器渲染模拟真人访问
+      const staticBlocked = Boolean(detectAccessBlock(response.status, "", staticHtml.slice(0, 12_000)));
+      if (needsBrowser(staticHtml, forceBrowser || staticBlocked || [401, 403, 429].includes(response.status))) {
         try {
           const dynamic = await renderHtml(response.url);
           bytes = Buffer.from(dynamic.html, "utf8");
@@ -826,6 +912,11 @@ function failed(
     rendered: false, discoveryMethod, warnings: [], pageType: "unknown", extractionMethod: "none",
     attemptCount: 1, failureCode,
   };
+}
+
+/** 供扫描循环的页级看门狗构造失败文档（与 fetchDocument 内部失败路径同一形状） */
+export function failedDocument(url: string, sourceId: string, error: string, discoveryMethod: DiscoveryMethod, failureCode: string) {
+  return failed(randomUUID(), url, sourceId, new Date().toISOString(), error, discoveryMethod, failureCode);
 }
 
 const COUNTRIES = ["菲律宾","马来西亚","塔吉克斯坦","缅甸","乌兹别克斯坦","新加坡","阿联酋","沙特","赞比亚","南非","坦桑尼亚","萨尔瓦多","哥伦比亚","罗马尼亚","芬兰","波兰","意大利","波黑","埃及","圭亚那","吉尔吉斯斯坦","格鲁吉亚","新西兰","越南","莱索托","蒙古国","印度尼西亚","澳大利亚","老挝","泰国","日本","埃塞俄比亚","智利","布基纳法索","柬埔寨","阿曼","哈萨克斯坦","匈牙利","科摩罗","美国","英国","德国","法国","西班牙","葡萄牙","希腊","土耳其","巴西","墨西哥","加拿大","印度","巴基斯坦"];
