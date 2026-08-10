@@ -87,6 +87,8 @@ export interface ScanRequest {
   mcpServerIds?: string[];
   mcpToolNames?: string[];
   budget: ScanBudget;
+  /** 忽略 robots.txt 抓取限制（个人研究用途，仅访问公开页面）；为 true 时配合浏览器渲染模拟真人访问 */
+  ignoreRobots?: boolean;
   referenceRows?: Record<string, unknown>[];
 }
 

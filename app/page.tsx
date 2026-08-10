@@ -347,6 +347,7 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
   const [startDate, setStartDate] = useState(`${new Date().getFullYear()}-01-01`);
   const [endDate, setEndDate] = useState(new Date().toISOString().slice(0, 10));
   const [budget, setBudget] = useState({ maxPages: 100, maxSearches: 30, maxMinutes: 10, maxConcurrency: 3, maxCostUsd: 2 });
+  const [ignoreRobots, setIgnoreRobots] = useState(true);
   const [referenceRows, setReferenceRows] = useState<Record<string, unknown>[]>([]);
   const [referenceName, setReferenceName] = useState("");
   const [busy, setBusy] = useState(false);
@@ -388,7 +389,7 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
     try {
       const scan = await api<Scan>("/api/scans", {
         method: "POST",
-        body: JSON.stringify({ startDate, endDate, fieldIds, sourceIds, providerId, modelId, searchProviderIds: searchIds, mcpServerIds: mcpIds, budget, referenceRows }),
+        body: JSON.stringify({ startDate, endDate, fieldIds, sourceIds, providerId, modelId, searchProviderIds: searchIds, mcpServerIds: mcpIds, budget, ignoreRobots, referenceRows }),
       });
       onCreated(scan);
     } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
@@ -473,6 +474,12 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
               <BudgetInput label="并发数" value={budget.maxConcurrency} onChange={(value) => setBudget({ ...budget, maxConcurrency: value })} />
               <BudgetInput label="模型费用上限（USD）" value={budget.maxCostUsd} min={0} step={0.5} onChange={(value) => setBudget({ ...budget, maxCostUsd: value })} />
             </div>
+            <CheckLine
+              checked={ignoreRobots}
+              label="模拟真人浏览器访问，忽略 robots.txt 抓取限制"
+              meta="仅限公开页面、个人研究用途；遇到反爬拦截时自动切换无头浏览器完整加载页面"
+              onChange={() => setIgnoreRobots(!ignoreRobots)}
+            />
             {preflightWarnings.length > 0 && <div className="preflight-warning"><strong>启动前请检查</strong>{preflightWarnings.map((warning) => <p key={warning}>• {warning}</p>)}</div>}
             <div className="summary-card">
               <h3>本次监测摘要</h3>

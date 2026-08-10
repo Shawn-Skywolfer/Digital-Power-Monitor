@@ -105,7 +105,31 @@ process.on("SIGTERM", () => stop("SIGTERM"));
 process.on("uncaughtException", (error) => writeLog("error", "守护进程未捕获异常", { error: error.message }));
 process.on("unhandledRejection", (error) => writeLog("error", "守护进程 Promise 异常", { error: String(error) }));
 
-startApi();
-startWeb();
-healthTimer = setInterval(() => void checkApiHealth(), 5_000);
-void checkApiHealth();
+async function probeHttp(url, timeoutMs = 1_500) {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    return response.ok;
+  } catch { return false; }
+}
+
+// 重复执行 `pnpm run dev` 会拉起第二个守护进程：其子进程因端口被占立即崩溃，
+// 守护逻辑又不限次重启，形成永久崩溃空转（2026-08-10 实测 2.6 小时约 3700 次重启）。
+// 启动前先探测：已有健康实例则退出/跳过对应子进程，健康检查失败时仍能自动接管。
+async function main() {
+  const [apiAlready, webAlready] = await Promise.all([
+    probeHttp(`${apiUrl}/health`),
+    probeHttp("http://127.0.0.1:3000"),
+  ]);
+  if (apiAlready && webAlready) {
+    writeLog("warn", "检测到已有实例在运行（API 8765 + Web 3000 均健康），本守护进程退出以避免重复启动");
+    process.exit(0);
+  }
+  if (apiAlready) writeLog("warn", "端口 8765 已有健康 API 服务，本实例不再重复启动 API（故障时将自动接管）");
+  else startApi();
+  if (webAlready) writeLog("warn", "端口 3000 已有 Web 服务，本实例不再重复启动 Web");
+  else startWeb();
+  healthTimer = setInterval(() => void checkApiHealth(), 5_000);
+  void checkApiHealth();
+}
+
+void main();
