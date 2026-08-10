@@ -23,6 +23,9 @@ import { pickExportDirectory, resolveExportDirectory } from "./export-directory"
 import retrievalPolicy from "../skills/scan-overseas-energy-projects/references/retrieval-policy.json";
 import { getRetrievalSkill, proposeRetrievalSkillIteration, reviewRetrievalSkillIteration } from "./skills";
 import { firecrawlKeyFromProfiles, mapWithFirecrawl, scrapeWithFirecrawl } from "./firecrawl";
+import {
+  LIGHTPANDA_VAULT_KEY, probeLightpanda, resetLightpanda, resolveLightpandaConfig, upsertBrowserRendering,
+} from "./lightpanda";
 import { chooseRecallBaseline, recallComparison, type ComparableScan } from "./recall";
 import { runAllSourceJobs } from "./source-scheduler";
 
@@ -52,6 +55,15 @@ const RETRIEVAL_POLICY_PATH = path.resolve("skills", "scan-overseas-energy-proje
 function currentRetrievalPolicy() {
   try { return JSON.parse(fs.readFileSync(RETRIEVAL_POLICY_PATH, "utf8")) as typeof retrievalPolicy; }
   catch { return retrievalPolicy; }
+}
+
+/** 对外返回 CDP 端点前抹掉 token query 参数 */
+function redactTokenParam(endpoint: string) {
+  try {
+    const parsed = new URL(endpoint);
+    if (parsed.searchParams.has("token")) parsed.searchParams.set("token", "***");
+    return parsed.toString();
+  } catch { return endpoint; }
 }
 
 function mapProvider(row: Record<string, unknown>): ModelProviderRecord {
@@ -556,8 +568,11 @@ async function runScan(scanId: string, request: ScanRequest) {
       }
       setProgress(scanId, { mcpCalls, mcpFailures, pagesDiscovered: discovered, pagesFetched: fetched, failures, failureReasons });
     }
+    // Firecrawl 熔断：402（额度耗尽）/429（限流）出现时，本次扫描后续不再调用 Firecrawl，
+    // 避免数百页每页都白调一次（402 在额度周期内不会自愈）
+    let firecrawlDisabled = false;
     const fetchWithFallback = async (...args: Parameters<typeof fetchDocument>) => {
-      if (firecrawlApiKey) {
+      if (firecrawlApiKey && !firecrawlDisabled) {
         mcpCalls++;
         try {
           const external = await scrapeWithFirecrawl(firecrawlApiKey, args[0], args[1]);
@@ -574,9 +589,16 @@ async function runScan(scanId: string, request: ScanRequest) {
           return selected;
         } catch (error) {
           mcpFailures++;
-          logScan(scanId, "warn", "mcp", "firecrawl_scrape_fallback_failed",
-            `Firecrawl 正文回退失败，继续使用本机采集：${error instanceof Error ? error.message : String(error)}`,
-            { url: args[0], sourceId: args[1] });
+          const message = error instanceof Error ? error.message : String(error);
+          if (/HTTP (402|429)/.test(message)) {
+            firecrawlDisabled = true;
+            logScan(scanId, "warn", "mcp", "firecrawl_circuit_open",
+              `Firecrawl 配额耗尽或限流（${message.slice(0, 80)}），本次扫描已停用 Firecrawl 回退，改用本机采集`, {});
+          } else {
+            logScan(scanId, "warn", "mcp", "firecrawl_scrape_fallback_failed",
+              `Firecrawl 正文回退失败，继续使用本机采集：${message}`,
+              { url: args[0], sourceId: args[1] });
+          }
         }
       }
       return fetchDocument(...args);
@@ -683,7 +705,7 @@ async function runScan(scanId: string, request: ScanRequest) {
       logScan(scanId, "info", "discovery", "source_started", `开始枚举来源：${source.name}`, { sourceId: source.id, url: source.url });
       const sourceQuota = Math.max(1, baseSourceQuota + (sourceIndex < extraSourceSlots ? 1 : 0));
       let discovery: Awaited<ReturnType<typeof discoverSourcePages>> | undefined;
-      if (firecrawlApiKey) {
+      if (firecrawlApiKey && !firecrawlDisabled) {
         try {
           const sourcePath = new URL(source.url).pathname;
           const looksLikeArticle = /\.(?:s?html?|pdf)$|\/detail|\/content|\/doc-|\/news\//i.test(sourcePath);
@@ -701,9 +723,16 @@ async function runScan(scanId: string, request: ScanRequest) {
           };
         } catch (error) {
           mcpFailures++;
-          logScan(scanId, "warn", "mcp", "firecrawl_map_failed",
-            `Firecrawl 枚举失败，切换本机 Sitemap/浏览器策略：${error instanceof Error ? error.message : String(error)}`,
-            { sourceId: source.id, source: source.name, url: source.url });
+          const message = error instanceof Error ? error.message : String(error);
+          if (/HTTP (402|429)/.test(message)) {
+            firecrawlDisabled = true;
+            logScan(scanId, "warn", "mcp", "firecrawl_circuit_open",
+              `Firecrawl 配额耗尽或限流（${message.slice(0, 80)}），本次扫描已停用 Firecrawl 枚举与回退`, {});
+          } else {
+            logScan(scanId, "warn", "mcp", "firecrawl_map_failed",
+              `Firecrawl 枚举失败，切换本机 Sitemap/浏览器策略：${message}`,
+              { sourceId: source.id, source: source.name, url: source.url });
+          }
         }
       }
       discovery ??= await discoverSourcePages(source, request.startDate, request.endDate, sourceQuota);
@@ -737,10 +766,10 @@ async function runScan(scanId: string, request: ScanRequest) {
           .run(now(), scanId, page.url);
         const doc = await fetchWithinBudget(page.url, source.id, page.method, /dynamic|spa|javascript/i.test(source.type));
         if (!doc) break;
-        fetchedForSource++;
         doc.dateStatus = dateStatusFor(doc, request.startDate, request.endDate);
         if (doc.error) {
           failures++; addFailure(doc.failureCode ?? "FETCH_ERROR");
+          fetchedForSource++;
           db.prepare("UPDATE crawl_queue SET status='failed',last_error=?,updated_at=? WHERE scan_id=? AND url=?")
             .run(doc.error, now(), scanId, page.url);
           logScan(scanId, "error", "fetch", "page_failed", `${doc.failureCode ?? "FETCH_ERROR"}：${doc.error}`, {
@@ -748,6 +777,10 @@ async function runScan(scanId: string, request: ScanRequest) {
           });
         } else {
           successfulForSource++;
+          // 配额按有效产出：列表/首页类聚合页不产生项目，不计入每来源正文配额，
+          // 让 sourceQuota 真正花在文章页上（全局 fetched 仍计数，防超预算）
+          const isAggregatorPage = ["listing", "homepage"].includes(doc.pageType) || doc.extractionMethod === "body-fallback";
+          if (!isAggregatorPage) fetchedForSource++;
           const quality = documentContentQuality(doc, page.url);
           if (quality.reliable && ["within_range", "date_unknown", "date_conflict"].includes(doc.dateStatus)) {
             const signal = `${doc.title}\n${doc.text.slice(0, 20_000)}`;
@@ -1371,6 +1404,19 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     const sourceRecord = url.pathname.match(/^\/api\/sources\/([^/]+)$/);
     if (req.method === "PUT" && sourceRecord) return sendJson(res, 200, updateSource(sourceRecord[1], body));
     if (req.method === "DELETE" && sourceRecord) return sendJson(res, 200, deleteSource(sourceRecord[1]));
+    const sourceCheck = url.pathname.match(/^\/api\/sources\/([^/]+)\/check$/);
+    if (req.method === "POST" && sourceCheck) {
+      const row = db.prepare("SELECT * FROM sources WHERE id=?").get(sourceCheck[1]) as Record<string, unknown> | undefined;
+      if (!row) throw new Error("信息源不存在");
+      const startedAt = Date.now();
+      const doc = await fetchDocument(String(row.url), String(row.id), "source");
+      return sendJson(res, 200, {
+        ok: !doc.error && doc.text.length >= 200, latencyMs: Date.now() - startedAt,
+        statusCode: doc.statusCode, failureCode: doc.failureCode, error: doc.error,
+        title: doc.title, textLength: doc.text.length, rendered: doc.rendered,
+        fetchMode: doc.fetchMode, pageType: doc.pageType, warnings: doc.warnings.slice(0, 5),
+      });
+    }
     if (req.method === "POST" && url.pathname === "/api/sources/import") return sendJson(res, 200, await importSources(body));
     if (req.method === "POST" && url.pathname === "/api/reference/import") return sendJson(res, 200, await importWorkbook(String(body.base64 ?? "")));
 
@@ -1459,6 +1505,40 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       }
     }
     if (req.method === "GET" && url.pathname === "/api/mcp-token") return sendJson(res, 200, { token: MCP_TOKEN, endpoint: `http://${HOST}:${PORT}/mcp` });
+
+    if (req.method === "GET" && url.pathname === "/api/browser-rendering") {
+      const config = resolveLightpandaConfig();
+      return sendJson(res, 200, {
+        enabled: config.enabled, endpoint: redactTokenParam(config.endpoint), backendOrder: config.backendOrder,
+        connectTimeoutMs: config.connectTimeoutMs, hasToken: config.hasToken ?? false,
+        source: config.source ?? "none", envEndpoint: Boolean(process.env.DPM_LIGHTPANDA_CDP_URL),
+      });
+    }
+    if (req.method === "POST" && url.pathname === "/api/browser-rendering") {
+      const order = Array.isArray(body.backendOrder) ? body.backendOrder : ["local", "lightpanda"];
+      const backendOrder = order.filter((item): item is "local" | "lightpanda" => item === "local" || item === "lightpanda");
+      if (!backendOrder.length) throw new Error("后端顺序至少包含 local 或 lightpanda 之一");
+      upsertBrowserRendering({
+        enabled: Boolean(body.enabled), endpoint: String(body.endpoint ?? ""),
+        backendOrder: [...new Set(backendOrder)], connectTimeoutMs: Number(body.connectTimeoutMs ?? 8_000),
+      });
+      if (typeof body.token === "string" && body.token.trim()) vault.set(LIGHTPANDA_VAULT_KEY, body.token.trim());
+      if (body.clearToken === true) vault.remove(LIGHTPANDA_VAULT_KEY);
+      await resetLightpanda();
+      audit("browser_rendering", "default", "saved", { ...body, token: body.token ? "***" : undefined });
+      const config = resolveLightpandaConfig();
+      return sendJson(res, 200, {
+        ok: true, enabled: config.enabled, endpoint: redactTokenParam(config.endpoint),
+        backendOrder: config.backendOrder, hasToken: config.hasToken ?? false,
+      });
+    }
+    if (req.method === "POST" && url.pathname === "/api/browser-rendering/test") {
+      const report = await probeLightpanda({
+        endpoint: typeof body.endpoint === "string" ? body.endpoint : undefined,
+        token: typeof body.token === "string" ? body.token : undefined,
+      });
+      return sendJson(res, 200, report);
+    }
 
     if (req.method === "GET" && url.pathname === "/api/scans") {
       const rows = db.prepare("SELECT id FROM scans ORDER BY created_at DESC LIMIT 100").all() as { id: string }[];
@@ -1563,8 +1643,14 @@ function deleteSource(id: string) {
   return { ok: true, id };
 }
 
+/** body.id 为空字符串时也必须生成新 UUID —— 空 id 行会让 UI 的测试/删除请求打到不存在的路由（404） */
+function recordId(body: JsonObject) {
+  const raw = String(body.id ?? "").trim();
+  return raw || randomUUID();
+}
+
 function saveProvider(body: JsonObject) {
-  const id = String(body.id ?? randomUUID()); const updated = now();
+  const id = recordId(body); const updated = now();
   const baseUrl = String(body.baseUrl ?? "https://api.openai.com");
   const requestedKind = String(body.kind ?? "openai-compatible");
   const kind = requestedKind === "openai" && !/^https:\/\/api\.openai\.com(?:\/|$)/i.test(baseUrl)
@@ -1604,7 +1690,7 @@ function clearProviderSecret(id: string) {
 }
 
 function saveSearchProvider(body: JsonObject) {
-  const id = String(body.id ?? randomUUID()); const updated = now();
+  const id = recordId(body); const updated = now();
   if (typeof body.apiKey === "string" && body.apiKey) vault.set(`search:${id}`, body.apiKey);
   db.prepare(`INSERT INTO search_providers VALUES (?,?,?,?,?,?,?,?,?)
     ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,endpoint=excluded.endpoint,
@@ -1620,7 +1706,7 @@ function saveSearchProvider(body: JsonObject) {
 }
 
 function saveMcpServer(body: JsonObject) {
-  const id = String(body.id ?? randomUUID()); const updated = now();
+  const id = recordId(body); const updated = now();
   const previous = db.prepare("SELECT env_keys_json FROM mcp_servers WHERE id=?").get(id) as { env_keys_json?: string } | undefined;
   const previousKeys = jsonParse<string[]>(previous?.env_keys_json, []);
   const suppliedEnv = body.env && typeof body.env === "object" && !Array.isArray(body.env)
@@ -1680,6 +1766,12 @@ function deleteMcpServer(id: string) {
 }
 
 function migrateLegacyMcpConfigurations() {
+  // 修复历史空 id 行：空 id 会让 UI 的测试/删除请求落到 /api/mcp-servers//xxx 而 404
+  const emptyIdRows = db.prepare("SELECT rowid FROM mcp_servers WHERE TRIM(id) = ''").all() as { rowid: number }[];
+  for (const { rowid } of emptyIdRows) {
+    db.prepare("UPDATE mcp_servers SET id=? WHERE rowid=?").run(randomUUID(), rowid);
+  }
+  if (emptyIdRows.length) audit("mcp_server", "-", "empty_id_repaired", { count: emptyIdRows.length });
   const rows = db.prepare("SELECT * FROM mcp_servers ORDER BY updated_at DESC").all() as Record<string, unknown>[];
   const parsed = rows.flatMap((row) => {
     const args = jsonParse<string[]>(row.args_json, []);

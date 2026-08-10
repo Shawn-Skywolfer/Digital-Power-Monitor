@@ -1,13 +1,15 @@
 import * as cheerio from "cheerio";
 import crypto, { randomUUID } from "node:crypto";
+import dns from "node:dns/promises";
 import fs from "node:fs";
 import path from "node:path";
 import type { Browser, BrowserContext } from "playwright-core";
 import type {
   CrawledDocument, DateStatus, DiscoveryMethod, DiscoveryReport, FieldDefinition,
-  JsonObject, SourceRecord,
+  JsonObject, RenderBackend, SourceRecord,
 } from "./types";
 import { DATA_DIR } from "./db";
+import { closeLightpanda, renderWithLightpanda, resolveLightpandaConfig, retireLightpandaContext } from "./lightpanda";
 
 const USER_AGENT = process.env.DPM_USER_AGENT ??
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -118,6 +120,38 @@ function networkErrorDetail(error: unknown, url: string) {
   return joined;
 }
 
+const fakeIpCache = new Map<string, { fake: boolean; expiresAt: number }>();
+
+/** 主动解析主机名，检测是否被 TUN 代理 Fake-IP（198.18.0.0/15）劫持；结果缓存 10 分钟 */
+export async function detectTunFakeIp(hostname: string): Promise<boolean> {
+  const cached = fakeIpCache.get(hostname);
+  if (cached && cached.expiresAt > Date.now()) return cached.fake;
+  let fake = false;
+  try {
+    const addresses = await dns.resolve4(hostname);
+    fake = addresses.length > 0 && addresses.every((address) => /^198\.(?:18|19)\./.test(address));
+  } catch { /* 解析失败本身不是 Fake-IP 证据 */ }
+  fakeIpCache.set(hostname, { fake, expiresAt: Date.now() + 10 * 60_000 });
+  return fake;
+}
+
+/**
+ * networkErrorDetail 的异步增强版：连接类失败时主动检测 TUN Fake-IP 劫持。
+ * undici 报错只带主机名不带解析 IP，198.18 检测必须主动 DNS 解析。
+ */
+async function networkErrorDetailAsync(error: unknown, url: string) {
+  const base = networkErrorDetail(error, url);
+  if (!/timeout|TIMEDOUT|UND_ERR|ECONN|socket|other side closed|EAI_AGAIN|ENOTFOUND|fetch failed/i.test(base)) return base;
+  try {
+    const hostname = new URL(url).hostname;
+    if (await detectTunFakeIp(hostname)) {
+      return `${base}。检测到 TUN 代理 Fake-IP 劫持（${hostname} 解析到 198.18.0.0/15）：全部流量被送往代理出口，` +
+        "目标站点拒绝了海外/代理 IP（央企与政务站点常见）。请将代理切换为规则模式或把该域名设为直连后重试";
+    }
+  } catch { /* URL 解析失败时保留原始错误 */ }
+  return base;
+}
+
 async function fetchText(url: string, accept = "text/html,application/xml,text/xml,*/*") {
   let response: Response;
   try {
@@ -169,8 +203,10 @@ export async function closeCrawlerBrowser() {
   await Promise.allSettled(contexts.map(async (context) => (await context).close()));
   const current = browserPromise;
   browserPromise = null;
-  if (!current) return;
-  try { await (await current).close(); } catch { /* browser may already be unavailable */ }
+  if (current) {
+    try { await (await current).close(); } catch { /* browser may already be unavailable */ }
+  }
+  await closeLightpanda();
 }
 
 async function getBrowserContext(url: string) {
@@ -197,17 +233,55 @@ async function retireBrowserContext(url: string) {
   if (context) await (await context).close().catch(() => undefined);
 }
 
-async function renderHtml(url: string) {
+export interface RenderedPage {
+  html: string;
+  url: string;
+  statusCode: number;
+  backend: RenderBackend;
+}
+
+type BackendRenderer = (url: string) => Promise<RenderedPage>;
+
+async function renderWithLocalBrowser(url: string): Promise<RenderedPage> {
   const context = await getBrowserContext(url);
   const page = await context.newPage();
   try {
     const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35_000 });
     await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
     await page.waitForTimeout(800);
-    return { html: await page.content(), url: page.url(), statusCode: response?.status() ?? 0 };
+    return { html: await page.content(), url: page.url(), statusCode: response?.status() ?? 0, backend: "local" };
   } finally {
     await page.close();
   }
+}
+
+// 测试注入缝：node --test 中用 stub 替换某个后端的渲染器，null 恢复默认
+const backendRendererOverrides = new Map<RenderBackend, BackendRenderer>();
+
+export function __setBackendRendererForTests(backend: RenderBackend, renderer: BackendRenderer | null) {
+  if (renderer) backendRendererOverrides.set(backend, renderer);
+  else backendRendererOverrides.delete(backend);
+}
+
+function renderWithBackend(url: string, backend: RenderBackend): Promise<RenderedPage> {
+  const override = backendRendererOverrides.get(backend);
+  if (override) return override(url);
+  return backend === "lightpanda" ? renderWithLightpanda(url) : renderWithLocalBrowser(url);
+}
+
+/** 按配置顺序依次尝试渲染后端；Lightpanda 未启用时链退化为 ["local"]，行为与改造前一致 */
+async function renderHtml(url: string): Promise<RenderedPage> {
+  const config = resolveLightpandaConfig();
+  const order = config.backendOrder.filter((backend) => backend !== "lightpanda" || config.enabled);
+  const errors: string[] = [];
+  for (const backend of order.length ? order : (["local"] as RenderBackend[])) {
+    try {
+      return await renderWithBackend(url, backend);
+    } catch (error) {
+      errors.push(`${backend === "lightpanda" ? "Lightpanda" : "本机浏览器"}：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw new Error(errors.join("；") || "没有可用的渲染后端");
 }
 
 export function detectAccessBlock(statusCode: number, title: string, text: string) {
@@ -237,7 +311,7 @@ async function discoveryHtml(url: string, forceBrowser = false) {
   try {
     result = await fetchText(url);
   } catch (error) {
-    staticError = error instanceof Error ? error.message : String(error);
+    staticError = await networkErrorDetailAsync(error, url);
   }
   if (result && !needsBrowser(result.text, forceBrowser)) {
     const blocked = detectAccessBlock(200, "", result.text);
@@ -255,6 +329,13 @@ async function discoveryHtml(url: string, forceBrowser = false) {
     const browserError = error instanceof Error ? error.message : String(error);
     throw new Error(`静态请求失败：${staticError || "未知错误"}；浏览器回退失败：${browserError}`);
   }
+}
+
+/** 站点把 HTML 片段写进 title/og:title 时（如中广核国际），剥掉残留标签并解码实体 */
+function cleanTitle(value: string) {
+  if (!value) return value;
+  if (!/<[a-zA-Z][\s\S]*?>/.test(value) && !/&[a-zA-Z#0-9]+;/.test(value)) return value.replace(/\s+/g, " ").trim();
+  return cheerio.load(`<span>${value}</span>`)("span").text().replace(/\s+/g, " ").trim();
 }
 
 function nearbyDate($: cheerio.CheerioAPI, element: unknown) {
@@ -367,12 +448,24 @@ export async function discoverSourcePages(
     report.strategies.push(home.rendered ? "browser-archive" : "archive");
     const queue: string[] = [home.url];
     const visited = new Set<string>();
-    const maxDiscoveryPages = Math.min(60, Math.max(8, Math.ceil(maxPages / 15)));
+    // 归档翻页上限：按日期回溯需要更深的翻页，原 maxPages/15 太浅（50 来源 × 配额 2 时仅 8 页），
+    // 放宽到能覆盖典型月度归档翻页（每页约 10~20 条，回溯一个月需翻 3~10 页）
+    const maxDiscoveryPages = Math.min(80, Math.max(16, Math.ceil(maxPages / 8)));
+    // 收集归档页上出现过的日期线索，用于判断是否需要继续向前翻页（解决"只抓到最新稿"）
+    const seenDates: string[] = [];
+    const trackDate = (hint?: string) => {
+      const normalized = dateFromText(hint);
+      if (normalized) seenDates.push(normalized);
+    };
+    const latestSeen = () => (seenDates.length ? seenDates.reduce((a, b) => (a > b ? a : b)) : null);
     while (queue.length && visited.size < maxDiscoveryPages &&
       ((methodCounts.get("archive") ?? 0) + (methodCounts.get("page-link") ?? 0)) < perMethodPool * 2) {
       const current = queue.shift()!;
       if (visited.has(current)) continue;
       visited.add(current);
+      // 日期深翻：当前页线索已全部早于 startDate（说明翻过了目标月），停止继续翻页
+      const newest = latestSeen();
+      if (newest && newest < startDate) break;
       try {
         const loaded = current === home.url ? home : await discoveryHtml(current);
         if (current !== home.url) report.discoveryPagesFetched++;
@@ -385,9 +478,15 @@ export async function discoverSourcePages(
           if (url.origin !== origin) return;
           const label = $(element).text().replace(/\s+/g, " ").trim();
           const hint = nearbyDate($, element);
+          trackDate(hint ?? label);
           const archiveLike = ARCHIVE_PATH.test(`${url.pathname} ${label}`) &&
             /page|archive|category|news|press|media|older|next|下一|更多|20\d{2}/i.test(`${url.pathname} ${label}`);
-          if (archiveLike && !visited.has(href) && !queue.includes(href)) queue.push(href);
+          // 日期深翻：列表页最新日期仍晚于 endDate（还没翻到目标月）→ 优先继续翻归档页
+          if (archiveLike && !visited.has(href) && !queue.includes(href)) {
+            const newest = latestSeen();
+            const needOlder = !newest || newest > endDate;
+            if (needOlder) queue.unshift(href); else queue.push(href);
+          }
           const contentLike = Boolean(hint) || CONTENT_PATH.test(url.pathname) ||
             (label.length >= 8 && !archiveLike && url.pathname.split("/").filter(Boolean).length >= 2);
           if (contentLike) add(href, archiveLike ? "archive" : "page-link", hint, label);
@@ -470,8 +569,8 @@ function parseHtml(html: string, responseUrl: string) {
   }
   const dateCandidates = [...new Set(dateValues.map((item) => dateFromText(item)).filter(Boolean) as string[])];
   const publishedAt = dateCandidates[0] ?? null;
-  const title = structuredTitle || $("meta[property='og:title']").attr("content") || $("h1").first().text().trim() ||
-    $("title").first().text().trim() || responseUrl;
+  const title = cleanTitle(structuredTitle || $("meta[property='og:title']").attr("content") || $("h1").first().text().trim() ||
+    $("title").first().text().trim() || responseUrl);
   const originalArticleCount = $("article").length;
   const datedBlocks = $("time,[datetime]").length + ($("body").text().match(/20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}/g)?.length ?? 0);
   const originalLinkCount = $("a[href]").length;
@@ -612,6 +711,7 @@ export async function fetchDocument(
     let effectiveStatusCode = response.status;
     let rendered = false;
     let fetchMode: "static" | "browser" = "static";
+    let renderedBackend = "";
     const warnings: string[] = [];
     if (contentType.includes("html") || contentType.includes("text")) {
       const staticHtml = bytes.toString("utf8");
@@ -623,6 +723,8 @@ export async function fetchDocument(
           effectiveStatusCode = dynamic.statusCode || response.status;
           rendered = true;
           fetchMode = "browser";
+          renderedBackend = dynamic.backend;
+          if (dynamic.backend === "lightpanda") warnings.push("渲染后端：Lightpanda（CDP）");
         } catch (error) {
           warnings.push(`动态渲染失败：${error instanceof Error ? error.message : String(error)}`);
         }
@@ -643,7 +745,7 @@ export async function fetchDocument(
     if (contentType.includes("html") || contentType.includes("text")) {
       const parsedHtml = parseHtml(bytes.toString("utf8"), responseUrl);
       ({ title, text, publishedAt, dateCandidates, dateEvidence, pageType, extractionMethod } = parsedHtml);
-      markdown = `# ${title}\n\n来源：${responseUrl}\n\n发布日期：${publishedAt ?? "未识别"}\n\n抓取方式：${fetchMode}\n\n${text}`;
+      markdown = `# ${title}\n\n来源：${responseUrl}\n\n发布日期：${publishedAt ?? "未识别"}\n\n抓取方式：${fetchMode}${renderedBackend ? `（${renderedBackend}）` : ""}\n\n${text}`;
       if (text.length < 200) warnings.push("正文过短，可能未完整提取");
     } else if (contentType.includes("pdf")) {
       title = path.basename(new URL(responseUrl).pathname) || "PDF 文档";
@@ -654,7 +756,9 @@ export async function fetchDocument(
     if (!fs.existsSync(markdownPath)) fs.writeFileSync(markdownPath, markdown, "utf8");
     const blocked = detectAccessBlock(effectiveStatusCode, title, text);
     if (blocked) warnings.push(blocked.reason);
-    if (blocked && rendered) await retireBrowserContext(responseUrl);
+    if (blocked && rendered) {
+      await Promise.allSettled([retireBrowserContext(responseUrl), retireLightpandaContext(responseUrl)]);
+    }
     const httpError = !blocked && effectiveStatusCode >= 400 ? `HTTP ${effectiveStatusCode}` : "";
     return {
       id, url: responseUrl, canonicalUrl: normalizeUrl(responseUrl), title, publishedAt, fetchedAt,
@@ -665,7 +769,7 @@ export async function fetchDocument(
       error: blocked ? blocked.reason : httpError || undefined,
     };
   } catch (error) {
-    const message = networkErrorDetail(error, canonicalUrl);
+    const message = await networkErrorDetailAsync(error, canonicalUrl);
     const code = /198\.(?:18|19)\.|EACCES|EPERM|proxy|代理/i.test(message) ? "PROXY_OR_DNS" :
       /timeout|aborted/i.test(message) ? "TIMEOUT" : /ENOTFOUND|EAI_AGAIN|fetch failed|ECONN/i.test(message) ? "NETWORK" : "FETCH_ERROR";
     return failed(id, canonicalUrl, sourceId, fetchedAt, message, discoveryMethod, code);
@@ -767,13 +871,18 @@ export function ruleProjectLikelihood(document: CrawledDocument) {
   const concrete = PROJECT_TERMS.test(text);
   const capacity = /\d+(?:\.\d+)?\s*(?:GW|MW|GWh|MWh|兆瓦|吉瓦|兆瓦时|吉瓦时)/i.test(text);
   let hasListingUrl = false;
+  let hasProductUrl = false;
   try {
-    hasListingUrl = /(?:^|\/)(?:archive|category|search|list|page)(?:\/|$)/i.test(new URL(document.url).pathname);
+    const pathname = new URL(document.url).pathname;
+    hasListingUrl = /(?:^|\/)(?:archive|category|search|list|page)(?:\/|$)/i.test(pathname);
+    hasProductUrl = /case[_-]?details?|products?[_-]?details?|\/products?\/|product[_-]?info|tagdetail/i.test(pathname);
   } catch { /* malformed URLs remain ineligible unless explicitly typed as an article */ }
+  // 产品详情/案例展示页是厂商营销内容，不是项目报道 —— 无论页型一律判为非项目
+  if (hasProductUrl) return { isProject: false, energy, concrete, capacity, eligiblePage: false, productPage: true };
   const strongUnknown = document.pageType === "unknown" && document.text.length >= 350 && !hasListingUrl &&
     (Boolean(document.publishedAt) || (articleLikeUrl(document.url) && energy && concrete && capacity));
   const eligiblePage = ["article", "document"].includes(document.pageType) || strongUnknown;
-  return { isProject: eligiblePage && energy && concrete && (capacity || /中标|开工|投产|并网|合同|award|construction|commission/i.test(text)), energy, concrete, capacity, eligiblePage };
+  return { isProject: eligiblePage && energy && concrete && (capacity || /中标|开工|投产|并网|合同|award|construction|commission/i.test(text)), energy, concrete, capacity, eligiblePage, productPage: false };
 }
 
 function findCapacity(text: string, regex: RegExp, storage = false) {
