@@ -516,6 +516,7 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
   const [logStage, setLogStage] = useState("all");
   const [selectedFailure, setSelectedFailure] = useState("");
   const [repairingBilingual, setRepairingBilingual] = useState("");
+  const [assessingPending, setAssessingPending] = useState(false);
   const filtered = results.filter((result) => filter === "all" || result.status === filter);
   const visibleLogs = logs.filter((log) => (logLevel === "all" || log.level === logLevel) && (logStage === "all" || log.stage === logStage));
   const failureReasons = (activeScan?.progress.failureReasons && typeof activeScan.progress.failureReasons === "object"
@@ -577,6 +578,18 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
       await refresh();
     } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
   }
+  async function assessPending() {
+    setAssessingPending(true);
+    try {
+      const outcome = await api<{ started: boolean; alreadyRunning: boolean; pending: number }>(
+        `/api/scans/${activeScanId}/assess-pending`, { method: "POST", body: "{}" });
+      notify(outcome.started
+        ? `补跑评估已开始：${outcome.pending} 个页面待评估，结果将陆续出现在下方列表`
+        : outcome.alreadyRunning ? "补跑评估正在进行中" : "没有待评估的页面");
+      await refresh();
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setAssessingPending(false); }
+  }
   async function decide(id: string, decision: string) {
     try { await api(`/api/results/${id}/decision`, { method: "POST", body: JSON.stringify({ decision }) }); notify("审核决定已保存"); await refresh(); }
     catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
@@ -605,7 +618,7 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
       </section>}
       <section className="task-bar panel">
         <label><span>监测任务</span><select value={activeScanId} onChange={(e) => setActiveScanId(e.target.value)}><option value="">选择任务</option>{scans.map((scan) => <option key={scan.id} value={scan.id}>{scan.id.slice(0, 8)} · {statusLabel(scan.status)}</option>)}</select></label>
-        {activeScan && <><ProgressRing value={Number(activeScan.progress.percent ?? 0)} /><div className="task-summary"><strong>{statusLabel(activeScan.status)}</strong><span>{Number(activeScan.progress.pagesDiscovered ?? 0)} 个文章链接 · {Number(activeScan.progress.pagesFetched ?? 0)} 页已抓取 · {Number(activeScan.progress.withinRange ?? 0)} 篇在时间范围内 · {Number(activeScan.progress.results ?? 0)} 个项目</span><small>网站处理 {Number(sourceCoverage?.settled ?? activeScan.progress.sourcesScanned ?? 0)}/{Number(sourceCoverage?.total ?? activeScan.progress.sourcesTotal ?? 0)} · 成功 {Number(sourceCoverage?.succeeded ?? 0)} · 失败 {Number(sourceCoverage?.failed ?? 0)} · 全文成功 {Number(activeScan.progress.fullTextSucceeded ?? 0)} · 动态渲染 {Number(activeScan.progress.dynamicPages ?? 0)} · MCP {Number(activeScan.progress.mcpCalls ?? 0)}/{Number(activeScan.progress.mcpFailures ?? 0)} · 日期不明/冲突 {Number(activeScan.progress.dateUnknown ?? 0)}/{Number(activeScan.progress.dateConflict ?? 0)} · 非项目/待复核 {Number(activeScan.progress.nonProjectArticles ?? 0)}/{Number(activeScan.progress.uncertainArticles ?? 0)} · 失败事件 {Number(activeScan.progress.failures ?? 0)}</small></div><div className="scan-controls">{activeScan.status === "running" && <button className="ghost small" onClick={() => void control("pause")}>Ⅱ 暂停</button>}{activeScan.status === "paused" && <button className="primary small" onClick={() => void control("resume")}>▶ 继续</button>}{["queued","running","paused"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void control("stop")}>■ 停止</button>}{["completed","failed","stopped"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void removeScan()}>⌫ 删除任务</button>}</div></>}
+        {activeScan && <><ProgressRing value={Number(activeScan.progress.percent ?? 0)} /><div className="task-summary"><strong>{statusLabel(activeScan.status)}</strong><span>{Number(activeScan.progress.pagesDiscovered ?? 0)} 个文章链接 · {Number(activeScan.progress.pagesFetched ?? 0)} 页已抓取 · {Number(activeScan.progress.withinRange ?? 0)} 篇在时间范围内 · {Number(activeScan.progress.results ?? 0)} 个项目</span><small>网站处理 {Number(sourceCoverage?.settled ?? activeScan.progress.sourcesScanned ?? 0)}/{Number(sourceCoverage?.total ?? activeScan.progress.sourcesTotal ?? 0)} · 成功 {Number(sourceCoverage?.succeeded ?? 0)} · 失败 {Number(sourceCoverage?.failed ?? 0)} · 全文成功 {Number(activeScan.progress.fullTextSucceeded ?? 0)} · 动态渲染 {Number(activeScan.progress.dynamicPages ?? 0)} · MCP {Number(activeScan.progress.mcpCalls ?? 0)}/{Number(activeScan.progress.mcpFailures ?? 0)} · 日期不明/冲突 {Number(activeScan.progress.dateUnknown ?? 0)}/{Number(activeScan.progress.dateConflict ?? 0)} · 非项目/待复核 {Number(activeScan.progress.nonProjectArticles ?? 0)}/{Number(activeScan.progress.uncertainArticles ?? 0)} · 失败事件 {Number(activeScan.progress.failures ?? 0)}</small></div><div className="scan-controls">{activeScan.status === "running" && <button className="ghost small" onClick={() => void control("pause")}>Ⅱ 暂停</button>}{activeScan.status === "paused" && <button className="primary small" onClick={() => void control("resume")}>▶ 继续</button>}{["queued","running","paused"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void control("stop")}>■ 停止</button>}{["failed","stopped"].includes(activeScan.status) && (Number(activeScan.progress.withinRange ?? 0) + Number(activeScan.progress.dateUnknown ?? 0) + Number(activeScan.progress.dateConflict ?? 0)) > 0 && <button className="primary small" disabled={assessingPending} onClick={() => void assessPending()}>{assessingPending ? "评估中…" : "⇪ 补跑评估"}</button>}{["completed","failed","stopped"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void removeScan()}>⌫ 删除任务</button>}</div></>}
       </section>
       {sourceCoverage && <section className={`source-coverage panel ${Number(sourceCoverage.failed ?? 0) > 0 ? "has-failures" : ""}`}>
         <div className="source-coverage-head"><div><strong>选定网站覆盖</strong><p>{Boolean(sourceCoverage.allSettled) ? `全部 ${Number(sourceCoverage.total ?? 0)} 个网站均已完成处理；失败网站不会被记作成功，但也不会阻断其他网站。` : `正在处理：已结算 ${Number(sourceCoverage.settled ?? 0)}/${Number(sourceCoverage.total ?? 0)} 个网站。任务只有在全部结算后才能完成。`}</p></div><div><span className="ok">成功 {Number(sourceCoverage.succeeded ?? 0)}</span><span className="bad">失败 {Number(sourceCoverage.failed ?? 0)}</span><span>运行中 {Number(sourceCoverage.running ?? 0)}</span><span>待处理 {Number(sourceCoverage.pending ?? 0)}</span></div></div>
