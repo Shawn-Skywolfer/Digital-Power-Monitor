@@ -77,13 +77,15 @@ async function checkApiHealth() {
       consecutiveFailures: consecutiveHealthFailures,
       error: error instanceof Error ? error.message : String(error),
     });
-    // 扫描高峰期事件循环可能短暂阻塞（大页 cheerio 解析、模型流式回调），
-    // 3 次失败（约 15s）就强杀会把健康但繁忙的 API 连同正在跑的扫描一起杀死
-    // （2026-08-11 08:38 实测：扫描进行到 10% 时被看门狗误杀）。放宽到 12 次（约 1 分钟）。
-    if (consecutiveHealthFailures >= 12) {
+    // 扫描高峰期事件循环可能长时间阻塞（病态大页 cheerio 解析等同步 CPU 工作）。
+    // 短阈值强杀会把健康但繁忙的 API 连同正在跑的扫描一起杀死
+    // （2026-08-11 08:38 三次失败约 15s 即误杀；放宽到 12 次后同日 08:52 又被
+    // 华润电力 PDF 页 83s 阻塞触发）。进程真崩溃有 exit 监听即时重启，看门狗只对付
+    // 挂死，放宽到 36 次（约 3 分钟）对单机工具是合理代价。
+    if (consecutiveHealthFailures >= 36) {
       consecutiveHealthFailures = 0;
       if (apiProcess && apiProcess.exitCode === null) {
-        writeLog("error", "API 连续十二次无响应，正在强制重启", { pid: apiProcess.pid });
+        writeLog("error", "API 连续三十六次无响应，正在强制重启", { pid: apiProcess.pid });
         apiProcess.kill("SIGTERM");
       } else {
         startApi();

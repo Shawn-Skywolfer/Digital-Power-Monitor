@@ -16,6 +16,7 @@ process.env.DPM_DATA_DIR = testDataDir;
 
 let origin = "";
 let server: http.Server;
+const requestedPaths: string[] = [];
 
 const weeklyEntry = (date: string, company: string, project: string, event: string) =>
   `<div class="entry"><h3>${company}${project}</h3><p>${date}，${company}${project}${event}。` +
@@ -55,6 +56,7 @@ const articlePage = (title: string, body: string, date: string) => `<!doctype ht
 before(async () => {
   server = http.createServer((request, response) => {
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+    requestedPaths.push(pathname);
     if (pathname === "/robots.txt") {
       response.setHeader("Content-Type", "text/plain");
       return void response.end("User-agent: *\nDisallow: /private/\n");
@@ -92,6 +94,23 @@ before(async () => {
       return void response.end(articlePage("越南光伏项目并网",
         "The 100 MW solar plant in Vietnam was connected to the grid in June 2026. 光伏项目顺利并网发电。",
         "2026-06-05"));
+    }
+    // 华润电力型栏目页：列表里混入 PDF 公告链接（2026-08-11 事故源，
+    // 几十 MB PDF 被当 HTML 解析曾把事件循环卡死 83s 触发看门狗强杀）
+    if (pathname === "/col/col2200/index.html") {
+      return void response.end(`<html><body><ul>
+        <li><a href="/kcxfzbg/2026-06-21/P020190412858756863432.pdf">项目公告 2026-06-21</a></li>
+        <li><a href="/art/2026/6/15/art_11018_200.html">蒙古乌兰巴托储能电站开工 2026-06-15</a></li>
+        </ul><a href="/col/col3300/index">下游栏目</a></body></html>`);
+    }
+    if (pathname === "/kcxfzbg/2026-06-21/P020190412858756863432.pdf") {
+      response.setHeader("Content-Type", "application/pdf");
+      return void response.end(Buffer.from("%PDF-1.4 fake binary for guard test"));
+    }
+    // 无扩展名的栏目页路径却返回 PDF（错配/魔数护栏）
+    if (pathname === "/col/col3300/index") {
+      response.setHeader("Content-Type", "application/pdf");
+      return void response.end(Buffer.from("%PDF-1.7 extensionless binary"));
     }
     response.statusCode = 404;
     response.end("not found");
@@ -175,4 +194,31 @@ test("overseasOnly: 全部为境内项目时降级为 non_project", async () => 
   const filtered = filterDomesticMentions(report([mention("中国 新疆"), mention("China"), mention("中国香港")]));
   assert.equal(filtered.classification, "non_project");
   assert.equal(filtered.mentions.length, 0);
+});
+
+test("binary: 栏目页中的 PDF 链接不进 BFS 队列也不进候选，同页文章不受影响", async () => {
+  const crawler = await import("../server/crawler");
+  const source: SourceRecord = {
+    id: "src-pdf", name: "PDF 拦截测试源", type: "网址", coverage: "",
+    url: `${origin}/col/col2200/index.html`, country: "", enabled: true, rateLimitMs: 0,
+  };
+  const before = requestedPaths.length;
+  const report = await crawler.discoverSourcePages(source, "2026-06-01", "2026-06-30", 50);
+  const urls = report.pages.map((page) => page.url);
+  assert.ok(!urls.some((url) => url.endsWith(".pdf")), "PDF 不应成为候选");
+  assert.ok(!requestedPaths.slice(before).some((p) => p.endsWith(".pdf")),
+    "PDF 不应被作为发现页抓取（2026-08-11 华润电力事故回归）");
+  assert.ok(urls.some((url) => url.includes("art_11018_200")), "同栏目页的正常 6 月文章仍应发现");
+});
+
+test("binary: 无扩展名栏目页返回 PDF 时按非 HTML 资源快速失败，不触发解析", async () => {
+  const crawler = await import("../server/crawler");
+  const source: SourceRecord = {
+    id: "src-pdf2", name: "错配类型测试源", type: "网址", coverage: "",
+    url: `${origin}/col/col2200/index.html`, country: "", enabled: true, rateLimitMs: 0,
+  };
+  const report = await crawler.discoverSourcePages(source, "2026-06-01", "2026-06-30", 50);
+  const failure = report.failures.find((f) => f.includes("col3300"));
+  assert.ok(failure, "扩展名缺失的二进制栏目页应记录失败");
+  assert.match(failure!, /非 HTML 资源/);
 });

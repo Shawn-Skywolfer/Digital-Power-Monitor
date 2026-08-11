@@ -15,7 +15,11 @@ const USER_AGENT = process.env.DPM_USER_AGENT ??
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const CONTENT_PATH = /news|press|media|article|story|project|blog|insight|announcement|release|20\d{2}[/-]\d{1,2}/i;
 const ARCHIVE_PATH = /news|press|media|articles?|archive|category|page|posts?|updates?|search|col(?:umn)?|channel|index|20\d{2}/i;
-const FILE_PATH = /\.(?:jpg|jpeg|png|gif|svg|webp|ico|css|js|woff2?|ttf|zip|rar|xlsx?|docx?|pptx?|mp4|mp3)(?:$|\?)/i;
+// PDF 也在排除之列：PDF 正文识别尚未实现（fetchDocument 只归档不抽取），作为候选永远不会
+// 产出项目；而一旦混进发现层 BFS 队列，几十 MB 的二进制会被当 HTML 交给 cheerio 同步解析，
+// 单页就能把事件循环卡死一分多钟（2026-08-11 华润电力 P020…pdf 实测单次阻塞 83s，
+// 连续触发 supervisor 看门狗强杀 API、扫描夭折）。
+const FILE_PATH = /\.(?:jpg|jpeg|png|gif|svg|webp|ico|css|js|woff2?|ttf|zip|rar|pdf|xlsx?|docx?|pptx?|mp4|mp3)(?:$|\?)/i;
 const ENERGY_TERMS = /光伏|储能|新能源|太阳能|风电|电站|EPC|solar|photovoltaic|battery|storage|renewable|wind\s*(?:farm|power|energy)|energy project/i;
 const PROJECT_TERMS = /项目|电站|电场|园区|基地|中标|开工|投产|并网|签署|合同|收购|融资|获批|project|plant|farm|facility|site|award|contract|construction|commission|acqui|financ|approv/i;
 
@@ -396,6 +400,17 @@ async function discoveryHtml(url: string, forceBrowser = false) {
     result = await fetchText(url);
   } catch (error) {
     staticError = await networkErrorDetailAsync(error, url);
+  }
+  // 发现层只处理 HTML/XML 文档：错配 Content-Type 的二进制（典型是 PDF 年报，
+  // 烂服务器常发 text/html）若交给 needsBrowser/cheerio 会把事件循环卡死数十秒。
+  // 魔数与类型双重判断；超大 body 截断到 8MB 兜底（正常栏目页远低于此）。
+  if (result) {
+    const looksBinary = result.contentType !== "" &&
+      !/html|xml|text|json|javascript/i.test(result.contentType);
+    if (looksBinary || result.text.startsWith("%PDF")) {
+      throw new Error(`非 HTML 资源（${result.contentType || "未知类型"}），发现层跳过`);
+    }
+    if (result.text.length > 8 * 1024 * 1024) result = { ...result, text: result.text.slice(0, 8 * 1024 * 1024) };
   }
   if (result && !needsBrowser(result.text, forceBrowser)) {
     const blocked = detectAccessBlock(200, "", result.text);
