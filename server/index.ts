@@ -14,7 +14,7 @@ import {
   dateStatusFor, discoverSourcePages, documentContentQuality, failedDocument, fetchDocument, normalizeUrl,
   rankDiscoveredUrls, setIgnoreRobots,
 } from "./crawler";
-import { applyBilingualRepair, assessArticle, mapProject, saveAssessment } from "./projects";
+import { applyBilingualRepair, assessArticle, filterDomesticMentions, mapProject, saveAssessment } from "./projects";
 import {
   ScanStoppedError, controlScan, getScanLogs, logScan, markScanActive, scanControlPoint,
 } from "./scan-runtime";
@@ -402,6 +402,7 @@ function normalizeScanRequest(payload: JsonObject): ScanRequest {
     mcpToolNames: Array.isArray(payload.mcpToolNames) ? payload.mcpToolNames.map(String) : [],
     budget,
     ignoreRobots: payload.ignoreRobots === true,
+    overseasOnly: payload.overseasOnly !== false,
     referenceRows: Array.isArray(payload.referenceRows) ? payload.referenceRows as Record<string, unknown>[] : undefined,
   };
 }
@@ -519,6 +520,7 @@ async function runScan(scanId: string, request: ScanRequest) {
       try {
         const analyzed = await assessArticle(doc, fields, provider, request.modelId,
           baselineHints.get(doc.canonicalUrl) ?? baselineHints.get(normalizeUrl(doc.url) ?? "") ?? []);
+        if (request.overseasOnly !== false) analyzed.assessment = filterDomesticMentions(analyzed.assessment);
         if (analyzed.modelUsed) modelExtractions++;
         if (analyzed.error) {
           doc.warnings.push(`模型判定失败，已使用规则兜底：${analyzed.error}`);
@@ -1157,6 +1159,10 @@ async function runPendingAssessment(scan: NonNullable<ReturnType<typeof getScan>
       try {
         const sourceRow = db.prepare("SELECT url FROM sources WHERE id=?").get(doc.sourceId) as { url: string } | undefined;
         const analyzed = await assessArticle(doc, fields, provider, scan.request.modelId);
+        if (scan.request.overseasOnly !== false) analyzed.assessment = filterDomesticMentions(analyzed.assessment);
+        if (analyzed.error) {
+          logScan(scanId, "error", "model", "extraction_failed", `补跑模型抽取失败，规则兜底：${analyzed.error}`, { url: doc.url, title: doc.title });
+        }
         saveAssessment(scanId, doc, analyzed.assessment, fields, sourceRow?.url ?? "", analyzed.modelUsed);
         assessed++;
         if (analyzed.assessment.classification === "project_report") mentions += analyzed.assessment.mentions.length;
@@ -1386,6 +1392,7 @@ async function deepExpandProject(row: Record<string, unknown>, args: JsonObject)
         pages++;
         if (doc.error || doc.dateStatus !== "within_range") continue;
         const analyzed = await assessArticle(doc, fields, provider, scan.request.modelId);
+        if (scan.request.overseasOnly !== false) analyzed.assessment = filterDomesticMentions(analyzed.assessment);
         saveAssessment(result.scanId, doc, analyzed.assessment, fields, "", analyzed.modelUsed);
       }
     }

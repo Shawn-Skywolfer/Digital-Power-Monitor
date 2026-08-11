@@ -155,12 +155,13 @@ export async function callModel(
   modelId: string,
   prompt: string,
   schema?: JsonObject,
+  options?: { maxOutputTokens?: number; timeoutMs?: number },
 ): Promise<unknown> {
   let lastError = "";
   let candidatePrompt = compactModelPrompt(prompt, 48_000);
   let candidateSchema = schema;
   for (let attempt = 1; attempt <= 2; attempt++) {
-    try { return await callModelOnce(provider, modelId, candidatePrompt, candidateSchema); }
+    try { return await callModelOnce(provider, modelId, candidatePrompt, candidateSchema, options); }
     catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
       const retryable = /timeout|aborted|fetch failed|HTTP (?:408|425|429|5\d\d)|empty|JSON/i.test(lastError);
@@ -192,10 +193,15 @@ async function callModelOnce(
   modelId: string,
   prompt: string,
   schema?: JsonObject,
+  options?: { maxOutputTokens?: number; timeoutMs?: number },
 ): Promise<unknown> {
   const { apiKey, headers } = secretHeaders(provider);
-  const timeout = Number(provider.config.timeoutMs ?? 60_000);
-  const maxOutputTokens = Number(provider.config.maxOutputTokens ?? 4096);
+  // 推理模型的 reasoning_content 与正文共享输出额度（实测 deepseek-v4-flash 思考占用
+  // 绝大部分 token 导致正文为空），周报类调用方需同时抬高 max_tokens 与超时
+  const timeout = Math.max(Number(provider.config.timeoutMs ?? 60_000), Number(options?.timeoutMs ?? 0));
+  // 周报/盘点页一次输出多个项目 mention（字段+原文+双语证据），4096 token 容易在 JSON 半途截断；
+  // 调用方可通过 options.maxOutputTokens 抬高下限（与提供商配置取大者）
+  const maxOutputTokens = Math.max(Number(provider.config.maxOutputTokens ?? 4096), Number(options?.maxOutputTokens ?? 0));
   if (provider.kind === "anthropic") {
     const data = await fetchJson(joinUrl(provider.baseUrl, "v1/messages"), {
       method: "POST", headers,

@@ -348,6 +348,7 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
   const [endDate, setEndDate] = useState(new Date().toISOString().slice(0, 10));
   const [budget, setBudget] = useState({ maxPages: 100, maxSearches: 30, maxMinutes: 10, maxConcurrency: 3, maxCostUsd: 2 });
   const [ignoreRobots, setIgnoreRobots] = useState(true);
+  const [overseasOnly, setOverseasOnly] = useState(true);
   const [referenceRows, setReferenceRows] = useState<Record<string, unknown>[]>([]);
   const [referenceName, setReferenceName] = useState("");
   const [busy, setBusy] = useState(false);
@@ -389,7 +390,7 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
     try {
       const scan = await api<Scan>("/api/scans", {
         method: "POST",
-        body: JSON.stringify({ startDate, endDate, fieldIds, sourceIds, providerId, modelId, searchProviderIds: searchIds, mcpServerIds: mcpIds, budget, ignoreRobots, referenceRows }),
+        body: JSON.stringify({ startDate, endDate, fieldIds, sourceIds, providerId, modelId, searchProviderIds: searchIds, mcpServerIds: mcpIds, budget, ignoreRobots, overseasOnly, referenceRows }),
       });
       onCreated(scan);
     } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
@@ -479,6 +480,12 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
               label="模拟真人浏览器访问，忽略 robots.txt 抓取限制"
               meta="仅限公开页面、个人研究用途；遇到反爬拦截时自动切换无头浏览器完整加载页面"
               onChange={() => setIgnoreRobots(!ignoreRobots)}
+            />
+            <CheckLine
+              checked={overseasOnly}
+              label="仅统计海外项目，自动排除中国境内项目"
+              meta="国家字段为中国境内的项目不计入监测结果；项目周报/盘点页会由模型逐条拆分抽取"
+              onChange={() => setOverseasOnly(!overseasOnly)}
             />
             {preflightWarnings.length > 0 && <div className="preflight-warning"><strong>启动前请检查</strong>{preflightWarnings.map((warning) => <p key={warning}>• {warning}</p>)}</div>}
             <div className="summary-card">

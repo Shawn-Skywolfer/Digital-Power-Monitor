@@ -89,6 +89,8 @@ export interface ScanRequest {
   budget: ScanBudget;
   /** 忽略 robots.txt 抓取限制（个人研究用途，仅访问公开页面）；为 true 时配合浏览器渲染模拟真人访问 */
   ignoreRobots?: boolean;
+  /** 仅统计海外项目（默认 true）：国家字段为中国境内的项目 mention 不计入监测结果 */
+  overseasOnly?: boolean;
   referenceRows?: Record<string, unknown>[];
 }
 
@@ -96,7 +98,7 @@ export type DateStatus = "within_range" | "outside_range" | "date_unknown" | "da
 export type ArticleClassification = "project_report" | "non_project" | "uncertain";
 export type DiscoveryMethod = "source" | "sitemap" | "rss" | "archive" | "page-link" | "search" | "mcp";
 export type FetchMode = "static" | "browser";
-export type PageType = "article" | "homepage" | "listing" | "document" | "unknown";
+export type PageType = "article" | "homepage" | "listing" | "roundup" | "document" | "unknown";
 export type ScanStatus = "queued" | "running" | "paused" | "stopping" | "stopped" | "completed" | "failed";
 
 export interface SearchResult {

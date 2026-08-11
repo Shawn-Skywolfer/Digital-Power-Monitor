@@ -14,8 +14,12 @@ import { closeLightpanda, renderWithLightpanda, resetLightpanda, resolveLightpan
 const USER_AGENT = process.env.DPM_USER_AGENT ??
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const CONTENT_PATH = /news|press|media|article|story|project|blog|insight|announcement|release|20\d{2}[/-]\d{1,2}/i;
-const ARCHIVE_PATH = /news|press|media|articles?|archive|category|page|posts?|updates?|search|20\d{2}/i;
-const FILE_PATH = /\.(?:jpg|jpeg|png|gif|svg|webp|ico|css|js|woff2?|ttf|zip|rar|xlsx?|docx?|pptx?|mp4|mp3)(?:$|\?)/i;
+const ARCHIVE_PATH = /news|press|media|articles?|archive|category|page|posts?|updates?|search|col(?:umn)?|channel|index|20\d{2}/i;
+// PDF 也在排除之列：PDF 正文识别尚未实现（fetchDocument 只归档不抽取），作为候选永远不会
+// 产出项目；而一旦混进发现层 BFS 队列，几十 MB 的二进制会被当 HTML 交给 cheerio 同步解析，
+// 单页就能把事件循环卡死一分多钟（2026-08-11 华润电力 P020…pdf 实测单次阻塞 83s，
+// 连续触发 supervisor 看门狗强杀 API、扫描夭折）。
+const FILE_PATH = /\.(?:jpg|jpeg|png|gif|svg|webp|ico|css|js|woff2?|ttf|zip|rar|pdf|xlsx?|docx?|pptx?|mp4|mp3)(?:$|\?)/i;
 const ENERGY_TERMS = /光伏|储能|新能源|太阳能|风电|电站|EPC|solar|photovoltaic|battery|storage|renewable|wind\s*(?:farm|power|energy)|energy project/i;
 const PROJECT_TERMS = /项目|电站|电场|园区|基地|中标|开工|投产|并网|签署|合同|收购|融资|获批|project|plant|farm|facility|site|award|contract|construction|commission|acqui|financ|approv/i;
 
@@ -397,6 +401,17 @@ async function discoveryHtml(url: string, forceBrowser = false) {
   } catch (error) {
     staticError = await networkErrorDetailAsync(error, url);
   }
+  // 发现层只处理 HTML/XML 文档：错配 Content-Type 的二进制（典型是 PDF 年报，
+  // 烂服务器常发 text/html）若交给 needsBrowser/cheerio 会把事件循环卡死数十秒。
+  // 魔数与类型双重判断；超大 body 截断到 8MB 兜底（正常栏目页远低于此）。
+  if (result) {
+    const looksBinary = result.contentType !== "" &&
+      !/html|xml|text|json|javascript/i.test(result.contentType);
+    if (looksBinary || result.text.startsWith("%PDF")) {
+      throw new Error(`非 HTML 资源（${result.contentType || "未知类型"}），发现层跳过`);
+    }
+    if (result.text.length > 8 * 1024 * 1024) result = { ...result, text: result.text.slice(0, 8 * 1024 * 1024) };
+  }
   if (result && !needsBrowser(result.text, forceBrowser)) {
     const blocked = detectAccessBlock(200, "", result.text);
     if (!blocked) return { html: result.text, url: result.url, rendered: false, statusCode: 200 };
@@ -533,13 +548,17 @@ export async function discoverSourcePages(
     const queue: string[] = [home.url];
     const visited = new Set<string>();
     // 归档翻页上限：按日期回溯需要更深的翻页，原 maxPages/15 太浅（50 来源 × 配额 2 时仅 8 页），
-    // 放宽到能覆盖典型月度归档翻页（每页约 10~20 条，回溯一个月需翻 3~10 页）
-    const maxDiscoveryPages = Math.min(80, Math.max(16, Math.ceil(maxPages / 8)));
+    // 放宽到能覆盖典型月度归档翻页（每页约 10~20 条，回溯一个月需翻 3~10 页）。
+    // 目标窗口越早（如 8 月扫 6 月），需要穿越越多近期归档页才能到达目标月，按窗口年龄加深，
+    // 避免像 2026-06 扫描那样：ceec 抓到 53 页却只有 1 页落在 6 月。
+    const ageMonths = Math.max(0, (Date.now() - Date.parse(`${startDate}T00:00:00Z`)) / (30 * 86_400_000) - 1);
+    const maxDiscoveryPages = Math.min(80, Math.max(16, Math.ceil(maxPages / 8))) + Math.min(96, Math.ceil(ageMonths) * 16);
     // 收集归档页上出现过的日期线索，用于判断是否需要继续向前翻页（解决"只抓到最新稿"）
     const seenDates: string[] = [];
+    let currentPageDates: string[] = [];
     const trackDate = (hint?: string) => {
       const normalized = dateFromText(hint);
-      if (normalized) seenDates.push(normalized);
+      if (normalized) { seenDates.push(normalized); currentPageDates.push(normalized); }
     };
     const latestSeen = () => (seenDates.length ? seenDates.reduce((a, b) => (a > b ? a : b)) : null);
     while (queue.length && visited.size < maxDiscoveryPages &&
@@ -547,39 +566,78 @@ export async function discoverSourcePages(
       const current = queue.shift()!;
       if (visited.has(current)) continue;
       visited.add(current);
-      // 日期深翻：当前页线索已全部早于 startDate（说明翻过了目标月），停止继续翻页
-      const newest = latestSeen();
-      if (newest && newest < startDate) break;
+      if (process.env.DPM_DEBUG_DISCOVERY) console.error(`[discovery] 翻页 #${visited.size} ${current} (队列余 ${queue.length})`);
+      currentPageDates = [];
       try {
         const loaded = current === home.url ? home : await discoveryHtml(current);
         if (current !== home.url) report.discoveryPagesFetched++;
         const $ = cheerio.load(loaded.html);
-        $("a[href]").each((_, element) => {
-          const href = normalizeUrl(String($(element).attr("href") ?? ""), loaded.url);
-          if (!href || FILE_PATH.test(href)) return;
-          let url: URL;
-          try { url = new URL(href); } catch { return; }
-          if (url.origin !== origin) return;
-          const label = $(element).text().replace(/\s+/g, " ").trim();
-          const hint = nearbyDate($, element);
-          trackDate(hint ?? label);
-          const archiveLike = ARCHIVE_PATH.test(`${url.pathname} ${label}`) &&
-            /page|archive|category|news|press|media|older|next|下一|更多|20\d{2}/i.test(`${url.pathname} ${label}`);
-          // 日期深翻：列表页最新日期仍晚于 endDate（还没翻到目标月）→ 优先继续翻归档页
-          if (archiveLike && !visited.has(href) && !queue.includes(href)) {
-            const newest = latestSeen();
-            const needOlder = !newest || newest > endDate;
-            if (needOlder) queue.unshift(href); else queue.push(href);
-          }
-          const contentLike = Boolean(hint) || CONTENT_PATH.test(url.pathname) ||
-            (label.length >= 8 && !archiveLike && url.pathname.split("/").filter(Boolean).length >= 2);
-          if (contentLike) add(href, archiveLike ? "archive" : "page-link", hint, label);
+        // 翻页链接先入暂存区，等本页日期统计完再决定是否入队：
+        // 本页日期全部早于 startDate 说明该栏目链已翻过目标月，不再向更老的翻页入队
+        // （局部剪枝——不像全局 break 那样误伤其他尚未访问的栏目）
+        const pendingPagination: string[] = [];
+        const processLinks = (doc: cheerio.CheerioAPI) => {
+          doc("a[href]").each((_, element) => {
+            const href = normalizeUrl(String(doc(element).attr("href") ?? ""), loaded.url);
+            if (!href || FILE_PATH.test(href)) return;
+            let url: URL;
+            try { url = new URL(href); } catch { return; }
+            if (url.origin !== origin) return;
+            // jpage 数据接口端点不是页面：记录集已在内嵌 XML 里，无需再访问接口
+            if (/dataproxy\.jsp/i.test(url.pathname)) return;
+            const label = doc(element).text().replace(/\s+/g, " ").trim();
+            // 列表日期常是 "06-29" 短格式（能建/电建栏目页），就近文本取不到完整日期时
+            // 从链接 URL 的 /art/2026/6/29/ 形态补出日期提示
+            const hint = nearbyDate(doc, element) ?? dateFromText(url.pathname) ?? undefined;
+            trackDate(hint ?? label);
+            // 归档/栏目页识别：除 news|press 等西文路径外，央企官网大量采用 TRS WCM 风格的
+            // /col/col11018/index.html 栏目页 + index_1.html 翻页（能建、电建、大唐均是），
+            // 链接文本常是"企业要闻"这类栏目标签，必须靠路径形态识别，否则 BFS 永远进不了归档层。
+            const pathAndLabel = `${url.pathname} ${label}`;
+            const columnPage = /\/col(?:umn|channel)?[/_]/i.test(url.pathname) ||
+              /(?:^|\/)index(?:_\d+)?\.s?html?$/i.test(url.pathname);
+            const paginationLabel = /^(?:下一页|上页|下页|尾页|next|older|\d{1,3})$/i.test(label);
+            const pagination = paginationLabel || /(?:^|\/)index_\d+\.s?html?$/i.test(url.pathname);
+            // 带日期的文章页 URL（/art/2026/6/29/...）是内容候选，不是栏目页——
+            // 若误当归档页入队会洪泛整个 BFS（实测能建 BFS 被 2021 年旧文链接带偏）
+            const datedArticle = /\/20\d{2}\/\d{1,2}\/\d{1,2}\//.test(url.pathname);
+            const archiveLike = !datedArticle && (columnPage || paginationLabel ||
+              (ARCHIVE_PATH.test(pathAndLabel) && /page|archive|category|news|press|media|older|next|下一|更多|20\d{2}/i.test(pathAndLabel)));
+            // 日期深翻：列表页最新日期仍晚于 endDate（还没翻到目标月）→ 优先继续翻归档页
+            if (archiveLike && !visited.has(href) && !queue.includes(href)) {
+              if (pagination) { if (!pendingPagination.includes(href)) pendingPagination.push(href); }
+              else {
+                const newest = latestSeen();
+                const needOlder = !newest || newest > endDate;
+                if (needOlder) queue.unshift(href); else queue.push(href);
+              }
+            }
+            const contentLike = Boolean(hint) || CONTENT_PATH.test(url.pathname) ||
+              (label.length >= 8 && !archiveLike && url.pathname.split("/").filter(Boolean).length >= 2);
+            if (contentLike) add(href, archiveLike ? "archive" : "page-link", hint, label);
+          });
+        };
+        processLinks($);
+        // TRS WCM jpage 栏目页把完整记录集（含多年历史）放在 <script type="text/xml"> 的
+        // datastore CDATA 里，DOM 中没有对应 <a> 元素，必须把内嵌 XML 再解析一遍，
+        // 否则栏目翻页完全依赖 JS，静态 BFS 只能看到第一页（能建/电建/大唐/华能同构）
+        $("script[type='text/xml']").each((_, scriptEl) => {
+          const xmlText = $(scriptEl).text();
+          if (!xmlText.includes("href")) return;
+          processLinks(cheerio.load(xmlText));
         });
+        const pageNewest = currentPageDates.length ? currentPageDates.reduce((a, b) => (a > b ? a : b)) : null;
+        if (!pageNewest || pageNewest >= startDate) {
+          for (const href of pendingPagination) if (!visited.has(href) && !queue.includes(href)) queue.unshift(href);
+        } else if (process.env.DPM_DEBUG_DISCOVERY && pendingPagination.length) {
+          console.error(`[discovery] 本页最新日期 ${pageNewest} 早于 ${startDate}，剪枝 ${pendingPagination.length} 个翻页链接`);
+        }
       } catch (error) {
         report.failures.push(`列表页 ${current}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     if (queue.length) report.truncated = true;
+    if (process.env.DPM_DEBUG_DISCOVERY) console.error(`[discovery] BFS 结束: visited=${visited.size}/${maxDiscoveryPages} 队列余=${queue.length} archive+page-link=${(methodCounts.get("archive") ?? 0) + (methodCounts.get("page-link") ?? 0)}/${perMethodPool * 2} 候选=${candidates.size} 失败=${report.failures.length}`);
   }
 
   if (!candidates.size) add(startUrl, "source");
@@ -690,7 +748,16 @@ function parseHtml(html: string, responseUrl: string) {
     (Boolean(publishedAt) && text.length >= 350 && datedBlocks < 8 && !isRoot && !listingPath);
   const listingSignal = originalArticleCount >= 3 || datedBlocks >= 8 ||
     (listingPath && originalLinkCount >= 12);
-  const pageType: CrawledDocument["pageType"] = articleSignal ? "article" : isRoot ? "homepage" : listingSignal ? "listing" : "unknown";
+  // 项目周报/双周报/盘点汇总页：形如"中企海外项目双周报"，一页含多条"日期+企业+项目+事件"记录。
+  // 这类页是海外项目监测的最高价值信源，但按日期块数量会被判成 listing 而被规则层直接丢弃
+  // （2026-06 扫描中一带一路网 3 篇周报正文已入库却 0 抽取），因此单列 roundup 页型放行模型逐条抽取。
+  const roundupTitle = /周报|双周报|月报|半月报|季报|盘点|汇总|集锦|一览|动态回顾|roundup|weekly|monthly|digest/i.test(title);
+  const projectEventBlocks = (text.slice(0, 60_000)
+    .match(/中标|签约|签署|开工|并网|投产|投运|承建|总承包|groundbreaking|commissioned|awarded|signed/g) ?? []).length;
+  const roundupSignal = !isRoot && !listingPath && text.length >= 800 &&
+    (roundupTitle || (datedBlocks >= 8 && projectEventBlocks >= 6));
+  const pageType: CrawledDocument["pageType"] = roundupSignal ? "roundup" :
+    articleSignal ? "article" : isRoot ? "homepage" : listingSignal ? "listing" : "unknown";
   return { title, text, publishedAt, dateCandidates, dateEvidence: dateValues[0] ?? "", pageType, extractionMethod };
 }
 
@@ -972,7 +1039,8 @@ export function ruleProjectLikelihood(document: CrawledDocument) {
   if (hasProductUrl) return { isProject: false, energy, concrete, capacity, eligiblePage: false, productPage: true };
   const strongUnknown = document.pageType === "unknown" && document.text.length >= 350 && !hasListingUrl &&
     (Boolean(document.publishedAt) || (articleLikeUrl(document.url) && energy && concrete && capacity));
-  const eligiblePage = ["article", "document"].includes(document.pageType) || strongUnknown;
+  // roundup（项目周报/盘点页）允许进入模型评估：页内每条项目记录由模型逐条抽取为独立 mention
+  const eligiblePage = ["article", "document", "roundup"].includes(document.pageType) || strongUnknown;
   return { isProject: eligiblePage && energy && concrete && (capacity || /中标|开工|投产|并网|合同|award|construction|commission/i.test(text)), energy, concrete, capacity, eligiblePage, productPage: false };
 }
 
