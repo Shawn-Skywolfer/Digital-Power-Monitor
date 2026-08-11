@@ -561,37 +561,55 @@ export async function discoverSourcePages(
         // 本页日期全部早于 startDate 说明该栏目链已翻过目标月，不再向更老的翻页入队
         // （局部剪枝——不像全局 break 那样误伤其他尚未访问的栏目）
         const pendingPagination: string[] = [];
-        $("a[href]").each((_, element) => {
-          const href = normalizeUrl(String($(element).attr("href") ?? ""), loaded.url);
-          if (!href || FILE_PATH.test(href)) return;
-          let url: URL;
-          try { url = new URL(href); } catch { return; }
-          if (url.origin !== origin) return;
-          const label = $(element).text().replace(/\s+/g, " ").trim();
-          const hint = nearbyDate($, element);
-          trackDate(hint ?? label);
-          // 归档/栏目页识别：除 news|press 等西文路径外，央企官网大量采用 TRS WCM 风格的
-          // /col/col11018/index.html 栏目页 + index_1.html 翻页（能建、电建、大唐均是），
-          // 链接文本常是"企业要闻"这类栏目标签，必须靠路径形态识别，否则 BFS 永远进不了归档层。
-          const pathAndLabel = `${url.pathname} ${label}`;
-          const columnPage = /\/col(?:umn|channel)?[/_]/i.test(url.pathname) ||
-            /(?:^|\/)index(?:_\d+)?\.s?html?$/i.test(url.pathname);
-          const paginationLabel = /^(?:下一页|上页|下页|尾页|next|older|\d{1,3})$/i.test(label);
-          const pagination = paginationLabel || /(?:^|\/)index_\d+\.s?html?$/i.test(url.pathname);
-          const archiveLike = columnPage || paginationLabel ||
-            (ARCHIVE_PATH.test(pathAndLabel) && /page|archive|category|news|press|media|older|next|下一|更多|20\d{2}/i.test(pathAndLabel));
-          // 日期深翻：列表页最新日期仍晚于 endDate（还没翻到目标月）→ 优先继续翻归档页
-          if (archiveLike && !visited.has(href) && !queue.includes(href)) {
-            if (pagination) { if (!pendingPagination.includes(href)) pendingPagination.push(href); }
-            else {
-              const newest = latestSeen();
-              const needOlder = !newest || newest > endDate;
-              if (needOlder) queue.unshift(href); else queue.push(href);
+        const processLinks = (doc: cheerio.CheerioAPI) => {
+          doc("a[href]").each((_, element) => {
+            const href = normalizeUrl(String(doc(element).attr("href") ?? ""), loaded.url);
+            if (!href || FILE_PATH.test(href)) return;
+            let url: URL;
+            try { url = new URL(href); } catch { return; }
+            if (url.origin !== origin) return;
+            // jpage 数据接口端点不是页面：记录集已在内嵌 XML 里，无需再访问接口
+            if (/dataproxy\.jsp/i.test(url.pathname)) return;
+            const label = doc(element).text().replace(/\s+/g, " ").trim();
+            // 列表日期常是 "06-29" 短格式（能建/电建栏目页），就近文本取不到完整日期时
+            // 从链接 URL 的 /art/2026/6/29/ 形态补出日期提示
+            const hint = nearbyDate(doc, element) ?? dateFromText(url.pathname) ?? undefined;
+            trackDate(hint ?? label);
+            // 归档/栏目页识别：除 news|press 等西文路径外，央企官网大量采用 TRS WCM 风格的
+            // /col/col11018/index.html 栏目页 + index_1.html 翻页（能建、电建、大唐均是），
+            // 链接文本常是"企业要闻"这类栏目标签，必须靠路径形态识别，否则 BFS 永远进不了归档层。
+            const pathAndLabel = `${url.pathname} ${label}`;
+            const columnPage = /\/col(?:umn|channel)?[/_]/i.test(url.pathname) ||
+              /(?:^|\/)index(?:_\d+)?\.s?html?$/i.test(url.pathname);
+            const paginationLabel = /^(?:下一页|上页|下页|尾页|next|older|\d{1,3})$/i.test(label);
+            const pagination = paginationLabel || /(?:^|\/)index_\d+\.s?html?$/i.test(url.pathname);
+            // 带日期的文章页 URL（/art/2026/6/29/...）是内容候选，不是栏目页——
+            // 若误当归档页入队会洪泛整个 BFS（实测能建 BFS 被 2021 年旧文链接带偏）
+            const datedArticle = /\/20\d{2}\/\d{1,2}\/\d{1,2}\//.test(url.pathname);
+            const archiveLike = !datedArticle && (columnPage || paginationLabel ||
+              (ARCHIVE_PATH.test(pathAndLabel) && /page|archive|category|news|press|media|older|next|下一|更多|20\d{2}/i.test(pathAndLabel)));
+            // 日期深翻：列表页最新日期仍晚于 endDate（还没翻到目标月）→ 优先继续翻归档页
+            if (archiveLike && !visited.has(href) && !queue.includes(href)) {
+              if (pagination) { if (!pendingPagination.includes(href)) pendingPagination.push(href); }
+              else {
+                const newest = latestSeen();
+                const needOlder = !newest || newest > endDate;
+                if (needOlder) queue.unshift(href); else queue.push(href);
+              }
             }
-          }
-          const contentLike = Boolean(hint) || CONTENT_PATH.test(url.pathname) ||
-            (label.length >= 8 && !archiveLike && url.pathname.split("/").filter(Boolean).length >= 2);
-          if (contentLike) add(href, archiveLike ? "archive" : "page-link", hint, label);
+            const contentLike = Boolean(hint) || CONTENT_PATH.test(url.pathname) ||
+              (label.length >= 8 && !archiveLike && url.pathname.split("/").filter(Boolean).length >= 2);
+            if (contentLike) add(href, archiveLike ? "archive" : "page-link", hint, label);
+          });
+        };
+        processLinks($);
+        // TRS WCM jpage 栏目页把完整记录集（含多年历史）放在 <script type="text/xml"> 的
+        // datastore CDATA 里，DOM 中没有对应 <a> 元素，必须把内嵌 XML 再解析一遍，
+        // 否则栏目翻页完全依赖 JS，静态 BFS 只能看到第一页（能建/电建/大唐/华能同构）
+        $("script[type='text/xml']").each((_, scriptEl) => {
+          const xmlText = $(scriptEl).text();
+          if (!xmlText.includes("href")) return;
+          processLinks(cheerio.load(xmlText));
         });
         const pageNewest = currentPageDates.length ? currentPageDates.reduce((a, b) => (a > b ? a : b)) : null;
         if (!pageNewest || pageNewest >= startDate) {
