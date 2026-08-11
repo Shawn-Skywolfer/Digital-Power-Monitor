@@ -115,6 +115,14 @@ export function ruleAssessment(document: CrawledDocument, fields: FieldDefinitio
   if (!likelihood.energy) {
     return { classification: "non_project", confidence: 0.86, reasoning: "正文未出现新能源技术或资产信息", sourceLanguage: detectSourceLanguage(document), mentions: [] };
   }
+  // 周报/盘点聚合页一页含多个项目，规则层无法逐条拆分；交给模型逐条抽取。
+  // 无模型可用时宁可判 uncertain 进入人工审核，也不能用整页字段拼出一个伪项目。
+  if (document.pageType === "roundup") {
+    return {
+      classification: "uncertain", confidence: 0.5,
+      reasoning: "项目周报/盘点聚合页，可能包含多个项目条目，需模型逐条抽取或人工审核", sourceLanguage: detectSourceLanguage(document), mentions: [],
+    };
+  }
   if (!likelihood.isProject) {
     return { classification: "uncertain", confidence: 0.55, reasoning: "涉及新能源，但缺少足以确认具体项目的事件或规模证据", sourceLanguage: detectSourceLanguage(document), mentions: [] };
   }
@@ -127,8 +135,32 @@ export function ruleAssessment(document: CrawledDocument, fields: FieldDefinitio
   };
 }
 
-type PriorProjectHint = { fields: Record<string, unknown>; primaryUrl: string };
+const DOMESTIC_COUNTRY = /中国|大陆|国内|内地|香港|澳门|台湾|hong\s*kong|macau|taiwan|^\s*china\s*$|^\s*prc\s*$/i;
 
+/**
+ * 海外口径过滤（overseasOnly）：国家字段指向中国境内的 mention 不计入监测结果。
+ * 国家字段为空（未知）的 mention 保留，交由人工审核确认国别。
+ */
+export function filterDomesticMentions(assessment: ArticleAssessment): ArticleAssessment {
+  if (assessment.classification !== "project_report") return assessment;
+  const kept = assessment.mentions.filter((mention) =>
+    !DOMESTIC_COUNTRY.test(String(mention.fields.country ?? "").trim()));
+  if (kept.length === assessment.mentions.length) return assessment;
+  if (kept.length === 0) {
+    return {
+      ...assessment, classification: "non_project",
+      reasoning: `${assessment.reasoning}；识别到的 ${assessment.mentions.length} 个项目均位于中国境内，海外口径下不计入结果`,
+      mentions: [],
+    };
+  }
+  return {
+    ...assessment,
+    reasoning: `${assessment.reasoning}；已按海外口径剔除 ${assessment.mentions.length - kept.length} 个中国境内项目`,
+    mentions: kept,
+  };
+}
+
+type PriorProjectHint = { fields: Record<string, unknown>; primaryUrl: string };
 function verifiedHintAssessment(document: CrawledDocument, fields: FieldDefinition[], hints: PriorProjectHint[]) {
   const body = `${document.title}\n${document.text}`;
   const normalizedBody = normalizedText(body);
@@ -254,7 +286,7 @@ export async function assessArticle(
 3. 一篇文章包含多个项目时，mentions 必须逐个输出；不要把多个项目拼成一条。
 4. 只使用正文证据。缺失字段返回 null，不推测。
 5. project_report 至少尽力抽取项目名称，以及国家/地点、容量、业主/开发商/EPC方、事件或报道时间中的可用字段。
-6. 当前页面类型为 ${document.pageType}。homepage/listing 页面必须判为 non_project，不能把公司名、网站名、栏目名当成项目名。
+6. 当前页面类型为 ${document.pageType}。homepage/listing 页面必须判为 non_project，不能把公司名、网站名、栏目名当成项目名。例外：页面类型为 roundup（项目周报/盘点汇总页）时，正文中每一条"日期+企业+项目+事件"的记录都是独立候选，必须逐条核验，凡涉及光伏、储能、风电等新能源项目的条目分别输出为独立 mention，不得遗漏、不得合并为一条；与新能源无关的条目（道路、市政、房建等）不要输出。
 7. 正文没有直接给出项目名称时，project_name 必须返回 null；不要自行把企业名称当项目名称，系统会按参与方、区域、规模和项目类型生成显示名。
 8. 检测网页主要语言并返回 sourceLanguage。若正文主要语言不是中文：fields 返回准确中文译名/译文，originalFields 返回网页中的原语言写法；evidence 必须逐字引用原文，evidenceTranslations 必须给出对应中文翻译。中文网页的 originalFields 可与 fields 相同，evidenceTranslations 可与 evidence 相同。
 9. 每个数值字段的 originalFields 必须保留“原数字+原单位”，例如 5 GWh、500 kW。fields 中功率统一换算为 MW、能量/储能容量统一换算为 MWh：1 GW=1000 MW，1 kW=0.001 MW，1 GWh=1000 MWh，1 kWh=0.001 MWh。不得把 5 GWh 写成 5000000 MWh。

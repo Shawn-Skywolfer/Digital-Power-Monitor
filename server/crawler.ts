@@ -14,7 +14,7 @@ import { closeLightpanda, renderWithLightpanda, resetLightpanda, resolveLightpan
 const USER_AGENT = process.env.DPM_USER_AGENT ??
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const CONTENT_PATH = /news|press|media|article|story|project|blog|insight|announcement|release|20\d{2}[/-]\d{1,2}/i;
-const ARCHIVE_PATH = /news|press|media|articles?|archive|category|page|posts?|updates?|search|20\d{2}/i;
+const ARCHIVE_PATH = /news|press|media|articles?|archive|category|page|posts?|updates?|search|col(?:umn)?|channel|index|20\d{2}/i;
 const FILE_PATH = /\.(?:jpg|jpeg|png|gif|svg|webp|ico|css|js|woff2?|ttf|zip|rar|xlsx?|docx?|pptx?|mp4|mp3)(?:$|\?)/i;
 const ENERGY_TERMS = /光伏|储能|新能源|太阳能|风电|电站|EPC|solar|photovoltaic|battery|storage|renewable|wind\s*(?:farm|power|energy)|energy project/i;
 const PROJECT_TERMS = /项目|电站|电场|园区|基地|中标|开工|投产|并网|签署|合同|收购|融资|获批|project|plant|farm|facility|site|award|contract|construction|commission|acqui|financ|approv/i;
@@ -533,8 +533,11 @@ export async function discoverSourcePages(
     const queue: string[] = [home.url];
     const visited = new Set<string>();
     // 归档翻页上限：按日期回溯需要更深的翻页，原 maxPages/15 太浅（50 来源 × 配额 2 时仅 8 页），
-    // 放宽到能覆盖典型月度归档翻页（每页约 10~20 条，回溯一个月需翻 3~10 页）
-    const maxDiscoveryPages = Math.min(80, Math.max(16, Math.ceil(maxPages / 8)));
+    // 放宽到能覆盖典型月度归档翻页（每页约 10~20 条，回溯一个月需翻 3~10 页）。
+    // 目标窗口越早（如 8 月扫 6 月），需要穿越越多近期归档页才能到达目标月，按窗口年龄加深，
+    // 避免像 2026-06 扫描那样：ceec 抓到 53 页却只有 1 页落在 6 月。
+    const ageMonths = Math.max(0, (Date.now() - Date.parse(`${startDate}T00:00:00Z`)) / (30 * 86_400_000) - 1);
+    const maxDiscoveryPages = Math.min(80, Math.max(16, Math.ceil(maxPages / 8))) + Math.min(96, Math.ceil(ageMonths) * 16);
     // 收集归档页上出现过的日期线索，用于判断是否需要继续向前翻页（解决"只抓到最新稿"）
     const seenDates: string[] = [];
     const trackDate = (hint?: string) => {
@@ -563,8 +566,15 @@ export async function discoverSourcePages(
           const label = $(element).text().replace(/\s+/g, " ").trim();
           const hint = nearbyDate($, element);
           trackDate(hint ?? label);
-          const archiveLike = ARCHIVE_PATH.test(`${url.pathname} ${label}`) &&
-            /page|archive|category|news|press|media|older|next|下一|更多|20\d{2}/i.test(`${url.pathname} ${label}`);
+          // 归档/栏目页识别：除 news|press 等西文路径外，央企官网大量采用 TRS WCM 风格的
+          // /col/col11018/index.html 栏目页 + index_1.html 翻页（能建、电建、大唐均是），
+          // 链接文本常是"企业要闻"这类栏目标签，必须靠路径形态识别，否则 BFS 永远进不了归档层。
+          const pathAndLabel = `${url.pathname} ${label}`;
+          const columnPage = /\/col(?:umn|channel)?[/_]/i.test(url.pathname) ||
+            /(?:^|\/)index(?:_\d+)?\.s?html?$/i.test(url.pathname);
+          const paginationLabel = /^(?:下一页|上页|下页|尾页|next|older|\d{1,3})$/i.test(label);
+          const archiveLike = columnPage || paginationLabel ||
+            (ARCHIVE_PATH.test(pathAndLabel) && /page|archive|category|news|press|media|older|next|下一|更多|20\d{2}/i.test(pathAndLabel));
           // 日期深翻：列表页最新日期仍晚于 endDate（还没翻到目标月）→ 优先继续翻归档页
           if (archiveLike && !visited.has(href) && !queue.includes(href)) {
             const newest = latestSeen();
@@ -690,7 +700,16 @@ function parseHtml(html: string, responseUrl: string) {
     (Boolean(publishedAt) && text.length >= 350 && datedBlocks < 8 && !isRoot && !listingPath);
   const listingSignal = originalArticleCount >= 3 || datedBlocks >= 8 ||
     (listingPath && originalLinkCount >= 12);
-  const pageType: CrawledDocument["pageType"] = articleSignal ? "article" : isRoot ? "homepage" : listingSignal ? "listing" : "unknown";
+  // 项目周报/双周报/盘点汇总页：形如"中企海外项目双周报"，一页含多条"日期+企业+项目+事件"记录。
+  // 这类页是海外项目监测的最高价值信源，但按日期块数量会被判成 listing 而被规则层直接丢弃
+  // （2026-06 扫描中一带一路网 3 篇周报正文已入库却 0 抽取），因此单列 roundup 页型放行模型逐条抽取。
+  const roundupTitle = /周报|双周报|月报|半月报|季报|盘点|汇总|集锦|一览|动态回顾|roundup|weekly|monthly|digest/i.test(title);
+  const projectEventBlocks = (text.slice(0, 60_000)
+    .match(/中标|签约|签署|开工|并网|投产|投运|承建|总承包|groundbreaking|commissioned|awarded|signed/g) ?? []).length;
+  const roundupSignal = !isRoot && !listingPath && text.length >= 800 &&
+    (roundupTitle || (datedBlocks >= 8 && projectEventBlocks >= 6));
+  const pageType: CrawledDocument["pageType"] = roundupSignal ? "roundup" :
+    articleSignal ? "article" : isRoot ? "homepage" : listingSignal ? "listing" : "unknown";
   return { title, text, publishedAt, dateCandidates, dateEvidence: dateValues[0] ?? "", pageType, extractionMethod };
 }
 
@@ -972,7 +991,8 @@ export function ruleProjectLikelihood(document: CrawledDocument) {
   if (hasProductUrl) return { isProject: false, energy, concrete, capacity, eligiblePage: false, productPage: true };
   const strongUnknown = document.pageType === "unknown" && document.text.length >= 350 && !hasListingUrl &&
     (Boolean(document.publishedAt) || (articleLikeUrl(document.url) && energy && concrete && capacity));
-  const eligiblePage = ["article", "document"].includes(document.pageType) || strongUnknown;
+  // roundup（项目周报/盘点页）允许进入模型评估：页内每条项目记录由模型逐条抽取为独立 mention
+  const eligiblePage = ["article", "document", "roundup"].includes(document.pageType) || strongUnknown;
   return { isProject: eligiblePage && energy && concrete && (capacity || /中标|开工|投产|并网|合同|award|construction|commission/i.test(text)), energy, concrete, capacity, eligiblePage, productPage: false };
 }
 
