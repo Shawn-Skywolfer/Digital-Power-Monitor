@@ -274,9 +274,10 @@ export async function assessArticle(
       })),
     )}\n\n当前网页正文：\n`
     : "";
-  // 周报/盘点页可能输出多个项目 mention，4096 token 会在 JSON 半途截断（实测双周报抽取被截成
-  // `{"classification": "project_re` 而判失败），此类页把输出上限抬高到 8192
-  const modelOptions = document.pageType === "roundup" ? { maxOutputTokens: 8192 } : undefined;
+  // 周报/盘点页可能输出多个项目 mention，且推理模型的思考链与正文共享输出额度
+  // （实测 deepseek-v4-flash 在 4096/8192 下 reasoning_content 耗尽预算、content 为空或被截断），
+  // 此类页把输出上限抬到 16384、超时抬到 180s
+  const modelOptions = document.pageType === "roundup" ? { maxOutputTokens: 16_384, timeoutMs: 180_000 } : undefined;
   try {
     const result = await callModel(
       provider,

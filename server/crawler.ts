@@ -540,9 +540,10 @@ export async function discoverSourcePages(
     const maxDiscoveryPages = Math.min(80, Math.max(16, Math.ceil(maxPages / 8))) + Math.min(96, Math.ceil(ageMonths) * 16);
     // 收集归档页上出现过的日期线索，用于判断是否需要继续向前翻页（解决"只抓到最新稿"）
     const seenDates: string[] = [];
+    let currentPageDates: string[] = [];
     const trackDate = (hint?: string) => {
       const normalized = dateFromText(hint);
-      if (normalized) seenDates.push(normalized);
+      if (normalized) { seenDates.push(normalized); currentPageDates.push(normalized); }
     };
     const latestSeen = () => (seenDates.length ? seenDates.reduce((a, b) => (a > b ? a : b)) : null);
     while (queue.length && visited.size < maxDiscoveryPages &&
@@ -550,13 +551,16 @@ export async function discoverSourcePages(
       const current = queue.shift()!;
       if (visited.has(current)) continue;
       visited.add(current);
-      // 日期深翻：当前页线索已全部早于 startDate（说明翻过了目标月），停止继续翻页
-      const newest = latestSeen();
-      if (newest && newest < startDate) break;
+      if (process.env.DPM_DEBUG_DISCOVERY) console.error(`[discovery] 翻页 #${visited.size} ${current} (队列余 ${queue.length})`);
+      currentPageDates = [];
       try {
         const loaded = current === home.url ? home : await discoveryHtml(current);
         if (current !== home.url) report.discoveryPagesFetched++;
         const $ = cheerio.load(loaded.html);
+        // 翻页链接先入暂存区，等本页日期统计完再决定是否入队：
+        // 本页日期全部早于 startDate 说明该栏目链已翻过目标月，不再向更老的翻页入队
+        // （局部剪枝——不像全局 break 那样误伤其他尚未访问的栏目）
+        const pendingPagination: string[] = [];
         $("a[href]").each((_, element) => {
           const href = normalizeUrl(String($(element).attr("href") ?? ""), loaded.url);
           if (!href || FILE_PATH.test(href)) return;
@@ -573,23 +577,34 @@ export async function discoverSourcePages(
           const columnPage = /\/col(?:umn|channel)?[/_]/i.test(url.pathname) ||
             /(?:^|\/)index(?:_\d+)?\.s?html?$/i.test(url.pathname);
           const paginationLabel = /^(?:下一页|上页|下页|尾页|next|older|\d{1,3})$/i.test(label);
+          const pagination = paginationLabel || /(?:^|\/)index_\d+\.s?html?$/i.test(url.pathname);
           const archiveLike = columnPage || paginationLabel ||
             (ARCHIVE_PATH.test(pathAndLabel) && /page|archive|category|news|press|media|older|next|下一|更多|20\d{2}/i.test(pathAndLabel));
           // 日期深翻：列表页最新日期仍晚于 endDate（还没翻到目标月）→ 优先继续翻归档页
           if (archiveLike && !visited.has(href) && !queue.includes(href)) {
-            const newest = latestSeen();
-            const needOlder = !newest || newest > endDate;
-            if (needOlder) queue.unshift(href); else queue.push(href);
+            if (pagination) { if (!pendingPagination.includes(href)) pendingPagination.push(href); }
+            else {
+              const newest = latestSeen();
+              const needOlder = !newest || newest > endDate;
+              if (needOlder) queue.unshift(href); else queue.push(href);
+            }
           }
           const contentLike = Boolean(hint) || CONTENT_PATH.test(url.pathname) ||
             (label.length >= 8 && !archiveLike && url.pathname.split("/").filter(Boolean).length >= 2);
           if (contentLike) add(href, archiveLike ? "archive" : "page-link", hint, label);
         });
+        const pageNewest = currentPageDates.length ? currentPageDates.reduce((a, b) => (a > b ? a : b)) : null;
+        if (!pageNewest || pageNewest >= startDate) {
+          for (const href of pendingPagination) if (!visited.has(href) && !queue.includes(href)) queue.unshift(href);
+        } else if (process.env.DPM_DEBUG_DISCOVERY && pendingPagination.length) {
+          console.error(`[discovery] 本页最新日期 ${pageNewest} 早于 ${startDate}，剪枝 ${pendingPagination.length} 个翻页链接`);
+        }
       } catch (error) {
         report.failures.push(`列表页 ${current}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     if (queue.length) report.truncated = true;
+    if (process.env.DPM_DEBUG_DISCOVERY) console.error(`[discovery] BFS 结束: visited=${visited.size}/${maxDiscoveryPages} 队列余=${queue.length} archive+page-link=${(methodCounts.get("archive") ?? 0) + (methodCounts.get("page-link") ?? 0)}/${perMethodPool * 2} 候选=${candidates.size} 失败=${report.failures.length}`);
   }
 
   if (!candidates.size) add(startUrl, "source");

@@ -1160,6 +1160,9 @@ async function runPendingAssessment(scan: NonNullable<ReturnType<typeof getScan>
         const sourceRow = db.prepare("SELECT url FROM sources WHERE id=?").get(doc.sourceId) as { url: string } | undefined;
         const analyzed = await assessArticle(doc, fields, provider, scan.request.modelId);
         if (scan.request.overseasOnly !== false) analyzed.assessment = filterDomesticMentions(analyzed.assessment);
+        if (analyzed.error) {
+          logScan(scanId, "error", "model", "extraction_failed", `补跑模型抽取失败，规则兜底：${analyzed.error}`, { url: doc.url, title: doc.title });
+        }
         saveAssessment(scanId, doc, analyzed.assessment, fields, sourceRow?.url ?? "", analyzed.modelUsed);
         assessed++;
         if (analyzed.assessment.classification === "project_report") mentions += analyzed.assessment.mentions.length;
