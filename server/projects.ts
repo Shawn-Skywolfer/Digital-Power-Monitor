@@ -274,6 +274,9 @@ export async function assessArticle(
       })),
     )}\n\n当前网页正文：\n`
     : "";
+  // 周报/盘点页可能输出多个项目 mention，4096 token 会在 JSON 半途截断（实测双周报抽取被截成
+  // `{"classification": "project_re` 而判失败），此类页把输出上限抬高到 8192
+  const modelOptions = document.pageType === "roundup" ? { maxOutputTokens: 8192 } : undefined;
   try {
     const result = await callModel(
       provider,
@@ -298,6 +301,7 @@ export async function assessArticle(
 正文：
 ${priorHintText}${document.text.slice(0, 100_000)}`,
       articleAnalysisSchema(fields),
+      modelOptions,
     );
     if (!modelAssessmentPayloadIsComplete(result)) {
       throw new Error("模型返回的结构化结果缺少 classification、reasoning、sourceLanguage 或 mentions，已拒绝空壳结果");
@@ -335,7 +339,7 @@ ${priorHintText}${document.text.slice(0, 100_000)}`,
   } catch (error) {
     const primaryError = error instanceof Error ? error.message : String(error);
     try {
-      const recovery = await callModel(provider, modelId, `从下面外文或中文网页中抽取现实新能源项目。只返回符合 JSON Schema 的对象；外文网页必须让 fields 为中文、originalFields 为原文、evidence 为原文证据、evidenceTranslations 为中文证据翻译。数值标准化为 MW/MWh，originalFields 保留原单位。\n标题：${document.title}\n正文：${document.text.slice(0, 14_000)}`, articleAnalysisSchema(fields));
+      const recovery = await callModel(provider, modelId, `从下面外文或中文网页中抽取现实新能源项目。只返回符合 JSON Schema 的对象；外文网页必须让 fields 为中文、originalFields 为原文、evidence 为原文证据、evidenceTranslations 为中文证据翻译。数值标准化为 MW/MWh，originalFields 保留原单位。\n标题：${document.title}\n正文：${document.text.slice(0, 14_000)}`, articleAnalysisSchema(fields), modelOptions);
       if (!modelAssessmentPayloadIsComplete(recovery)) throw new Error("精简恢复结果结构不完整");
       let recovered = normalizeAssessment(recovery, document, fields);
       if (bilingualAssessmentGaps(recovered, fields).length) recovered = await repairBilingualAssessment(recovered, document, fields, provider, modelId);
