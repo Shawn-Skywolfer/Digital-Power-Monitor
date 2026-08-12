@@ -137,6 +137,8 @@ function addColumnIfMissing(table: string, definition: string) {
 }
 
 addColumnIfMissing("mcp_servers", "env_keys_json TEXT NOT NULL DEFAULT '[]'");
+// sources 建表时漏了 updated_at，而 updateSource 会写它——缺列导致来源编辑接口整体报错
+addColumnIfMissing("sources", "updated_at TEXT");
 addColumnIfMissing("documents", "date_status TEXT NOT NULL DEFAULT 'date_unknown'");
 addColumnIfMissing("documents", "date_evidence TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("documents", "date_candidates_json TEXT NOT NULL DEFAULT '[]'");
