@@ -276,8 +276,12 @@ export async function assessArticle(
     : "";
   // 周报/盘点页可能输出多个项目 mention，且推理模型的思考链与正文共享输出额度
   // （实测 deepseek-v4-flash 在 4096/8192 下 reasoning_content 耗尽预算、content 为空或被截断），
-  // 此类页把输出上限抬到 16384、超时抬到 180s
-  const modelOptions = document.pageType === "roundup" ? { maxOutputTokens: 16_384, timeoutMs: 180_000 } : undefined;
+  // 此类页把输出上限抬到 16384、超时抬到 180s。
+  // 普通文章页同样受思考链挤占（2026-08-12 定向扫描 58/101 页模型返回空内容走规则兜底，
+  // 瑞源越南 110MWh 条目因此被规则粗提未落成项目），默认额度也从 4096 抬到 8192。
+  const modelOptions = document.pageType === "roundup"
+    ? { maxOutputTokens: 16_384, timeoutMs: 180_000 }
+    : { maxOutputTokens: 8_192, timeoutMs: 120_000 };
   try {
     const result = await callModel(
       provider,
