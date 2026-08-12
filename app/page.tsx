@@ -337,6 +337,9 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
   onCreated: (scan: Scan) => void; onError: (message: string) => void;
 }) {
   const [step, setStep] = useState(1);
+  const [acquisitionMode, setAcquisitionMode] = useState<"web" | "project-intel">("web");
+  const [periodMode, setPeriodMode] = useState<"month" | "custom">("month");
+  const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
   const [fieldIds, setFieldIds] = useState<string[]>(fields.map((field) => field.id));
   const [sourceIds, setSourceIds] = useState<string[]>(sources.filter((source) => source.enabled).map((source) => source.id));
   const [providerId, setProviderId] = useState("");
@@ -352,6 +355,25 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
   const [referenceRows, setReferenceRows] = useState<Record<string, unknown>[]>([]);
   const [referenceName, setReferenceName] = useState("");
   const [busy, setBusy] = useState(false);
+
+  function applyMonth(month: string) {
+    if (!/^\d{4}-\d{2}$/.test(month)) return;
+    const [year, monthNumber] = month.split("-").map(Number);
+    const lastDay = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+    setSelectedMonth(month);
+    setStartDate(`${month}-01`);
+    setEndDate(`${month}-${String(lastDay).padStart(2, "0")}`);
+  }
+
+  function chooseAcquisitionMode(mode: "web" | "project-intel") {
+    setAcquisitionMode(mode);
+    setStep(1);
+    if (mode === "project-intel") {
+      setPeriodMode("month");
+      applyMonth(selectedMonth);
+      setBudget((current) => ({ ...current, maxPages: Math.max(500, current.maxPages) }));
+    }
+  }
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -381,7 +403,7 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
   }
 
   async function start() {
-    if (sourceIds.length && budget.maxPages < sourceIds.length) {
+    if (acquisitionMode === "web" && sourceIds.length && budget.maxPages < sourceIds.length) {
       setStep(5);
       onError(`已选择 ${sourceIds.length} 个来源，最大抓取页数至少应为 ${sourceIds.length}，才能为每个来源保留 1 页额度。`);
       return;
@@ -390,7 +412,7 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
     try {
       const scan = await api<Scan>("/api/scans", {
         method: "POST",
-        body: JSON.stringify({ startDate, endDate, fieldIds, sourceIds, providerId, modelId, searchProviderIds: searchIds, mcpServerIds: mcpIds, budget, ignoreRobots, overseasOnly, referenceRows }),
+        body: JSON.stringify({ acquisitionMode, startDate, endDate, fieldIds, sourceIds: acquisitionMode === "web" ? sourceIds : [], providerId, modelId, searchProviderIds: searchIds, mcpServerIds: mcpIds, budget, ignoreRobots, overseasOnly, referenceRows: acquisitionMode === "web" ? referenceRows : undefined }),
       });
       onCreated(scan);
     } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
@@ -400,9 +422,9 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
   const steps = ["选择字段", "时间范围", "监测来源", "能力组合", "预算与确认"];
   const rangeDays = startDate && endDate ? Math.max(0, Math.round((Date.parse(endDate) - Date.parse(startDate)) / 86_400_000) + 1) : 0;
   const preflightWarnings = [
-    budget.maxPages < sourceIds.length ? `总页数 ${budget.maxPages} 小于来源数 ${sourceIds.length}，无法保证每站至少检查 1 页。` : "",
+    acquisitionMode === "web" && budget.maxPages < sourceIds.length ? `总页数 ${budget.maxPages} 小于来源数 ${sourceIds.length}，无法保证每站至少检查 1 页。` : "",
     rangeDays === 1 ? "当前只检索单日发布内容；多数官网并非每天发布项目消息，结果很容易为 0。" : "",
-    sourceIds.length >= 20 && !searchIds.length && !mcpIds.length ? "来源较多且未启用搜索 API/MCP；官网连接失败时没有外部检索回退。" : "",
+    acquisitionMode === "web" && sourceIds.length >= 20 && !searchIds.length && !mcpIds.length ? "来源较多且未启用搜索 API/MCP；官网连接失败时没有外部检索回退。" : "",
   ].filter(Boolean);
   return (
     <div className="wizard-layout">
@@ -414,6 +436,14 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
         ))}
       </aside>
       <section className="wizard-panel">
+        <div className="scan-mode-tabs" role="tablist" aria-label="检索方式">
+          <button type="button" role="tab" aria-selected={acquisitionMode === "web"} className={acquisitionMode === "web" ? "active" : ""} onClick={() => chooseAcquisitionMode("web")}>
+            <span>⌁</span><div><strong>多来源网页监测</strong><small>扫描自建来源库、搜索 API 与 MCP</small></div>
+          </button>
+          <button type="button" role="tab" aria-selected={acquisitionMode === "project-intel"} className={acquisitionMode === "project-intel" ? "active" : ""} onClick={() => chooseAcquisitionMode("project-intel")}>
+            <span>▦</span><div><strong>Project Intel 批量采集</strong><small>按发布时间范围导入结构化项目</small></div>
+          </button>
+        </div>
         <div className="wizard-head">
           <div><p className="eyebrow">步骤 {step} / 5</p><h2>{steps[step - 1]}</h2></div>
           <span className="step-chip">{Math.round((step / 5) * 100)}%</span>
@@ -424,22 +454,30 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
             <div className="field-grid">
               {fields.map((field) => <CheckCard key={field.id} checked={fieldIds.includes(field.id)} title={field.label.replace("\n", " ")} meta={`${field.type}${field.unit ? ` · ${field.unit}` : ""}`} onChange={() => setFieldIds(toggle(fieldIds, field.id))} />)}
             </div>
-            <label className="upload-box compact"><input type="file" accept=".xlsx" onChange={(event) => void loadReference(event.target.files?.[0])} /><span>⇧</span><div><strong>上传项目参考表（可选）</strong><p>{referenceName ? `${referenceName} · ${referenceRows.length} 条记录` : "用于给已有项目逐条寻找原始页面"}</p></div></label>
+            {acquisitionMode === "web" && <label className="upload-box compact"><input type="file" accept=".xlsx" onChange={(event) => void loadReference(event.target.files?.[0])} /><span>⇧</span><div><strong>上传项目参考表（可选）</strong><p>{referenceName ? `${referenceName} · ${referenceRows.length} 条记录` : "用于给已有项目逐条寻找原始页面"}</p></div></label>}
           </div>
         )}
         {step === 2 && (
           <div className="form-section">
-            <p className="section-copy">系统按网页发布日期筛选，开始与结束日期均包含。没有可识别发布日期的页面会保留并进入人工审核。</p>
+            <p className="section-copy">{acquisitionMode === "project-intel" ? "按 Project Intel 的收录发布时间（recorded_at）筛选，开始与结束日期均包含。可以直接选择整月，也可以自定义日期。" : "系统按网页发布日期筛选，开始与结束日期均包含。没有可识别发布日期的页面会保留并进入人工审核。"}</p>
+            {acquisitionMode === "project-intel" && <div className="period-mode">
+              <button type="button" className={periodMode === "month" ? "active" : ""} onClick={() => { setPeriodMode("month"); applyMonth(selectedMonth); }}>按月</button>
+              <button type="button" className={periodMode === "custom" ? "active" : ""} onClick={() => setPeriodMode("custom")}>自定义日期</button>
+            </div>}
+            {acquisitionMode === "project-intel" && periodMode === "month" && <label className="month-field"><span>发布月份</span><input type="month" value={selectedMonth} onChange={(event) => applyMonth(event.target.value)} /></label>}
             <div className="date-range">
-              <label><span>开始日期</span><input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} /></label>
+              <label><span>开始日期</span><input type="date" value={startDate} disabled={acquisitionMode === "project-intel" && periodMode === "month"} onChange={(e) => setStartDate(e.target.value)} /></label>
               <i>→</i>
-              <label><span>结束日期</span><input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} /></label>
+              <label><span>结束日期</span><input type="date" value={endDate} disabled={acquisitionMode === "project-intel" && periodMode === "month"} onChange={(e) => setEndDate(e.target.value)} /></label>
             </div>
-            <div className="info-card"><span>i</span><div><strong>日期口径</strong><p>这里指信息来源网页的公开发布日期，而不是项目开工、签约或投产日期。</p></div></div>
+            <div className="info-card"><span>i</span><div><strong>日期口径</strong><p>{acquisitionMode === "project-intel" ? "这里指项目进入 Project Intel 数据库的时间，不是项目开工、签约或投产日期。" : "这里指信息来源网页的公开发布日期，而不是项目开工、签约或投产日期。"}</p></div></div>
           </div>
         )}
         {step === 3 && (
-          <div>
+          acquisitionMode === "project-intel" ? <div className="project-intel-source">
+            <div className="project-intel-source-head"><span>▦</span><div><strong>Project Intel · 风光氢储出海数据库</strong><p>energy-overseas.com/project-intel</p></div><em>已固定选择</em></div>
+            <div className="project-intel-policy"><strong>温和采集策略</strong><p>只读取公开的结构化列表接口；沿用站点前端每页 20 条的分页、请求串行、分页间隔至少 3 秒；不逐条打开详情页，遇到限流自动退避。</p></div>
+          </div> : <div>
             <div className="section-intro"><p>已选择 {sourceIds.length} / {sources.length} 个来源。系统会优先扫描站点栏目、RSS 和站点地图。</p><button className="ghost small" onClick={() => setSourceIds(sourceIds.length === sources.length ? [] : sources.map((source) => source.id))}>切换全选</button></div>
             <div className="source-picker">
               {sources.length === 0 && <Empty text="请先到“监测来源”导入信息来源.xlsx 或手工添加站点。" />}
@@ -454,7 +492,10 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
           </div>
         )}
         {step === 4 && (
-          <div className="form-section">
+          acquisitionMode === "project-intel" ? <div className="form-section">
+            <div className="info-card project-intel-capability"><span>✓</span><div><strong>无需额外模型或搜索服务</strong><p>项目列表已经提供名称、国家、规模、开发商、EPC、阶段、正文和收录时间。本模式直接映射结构化字段，可减少外部请求和模型费用。</p></div></div>
+            <div className="project-intel-policy"><strong>结果复核</strong><p>Project Intel 属于二手聚合信息，导入结果会自动进入人工复核，并保留原项目链接与完整字段证据。</p></div>
+          </div> : <div className="form-section">
             <div className="form-grid">
               <label><span>抽取模型供应商</span><select value={providerId} onChange={(e) => void chooseProvider(e.target.value)}><option value="">仅规则抽取</option>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></label>
               <label><span>模型</span><select value={modelId} onChange={(e) => setModelId(e.target.value)} disabled={!providerId}><option value="">选择模型</option>{modelOptions.map((model) => <option key={model.id} value={model.id}>{model.name || model.id}</option>)}</select></label>
@@ -469,18 +510,16 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
         {step === 5 && (
           <div className="form-section">
             <div className="budget-grid">
-              <BudgetInput label="最大抓取页数" value={budget.maxPages} onChange={(value) => setBudget({ ...budget, maxPages: value })} />
-              <BudgetInput label="最大搜索次数" value={budget.maxSearches} min={0} onChange={(value) => setBudget({ ...budget, maxSearches: value })} />
-              <BudgetInput label="运行时长参考（分钟，不截断）" value={budget.maxMinutes} onChange={(value) => setBudget({ ...budget, maxMinutes: value })} />
-              <BudgetInput label="并发数" value={budget.maxConcurrency} onChange={(value) => setBudget({ ...budget, maxConcurrency: value })} />
-              <BudgetInput label="模型费用上限（USD）" value={budget.maxCostUsd} min={0} step={0.5} onChange={(value) => setBudget({ ...budget, maxCostUsd: value })} />
+              <BudgetInput label={acquisitionMode === "project-intel" ? "最大导入项目数" : "最大抓取页数"} value={budget.maxPages} onChange={(value) => setBudget({ ...budget, maxPages: value })} />
+              {acquisitionMode === "web" && <><BudgetInput label="最大搜索次数" value={budget.maxSearches} min={0} onChange={(value) => setBudget({ ...budget, maxSearches: value })} /><BudgetInput label="运行时长参考（分钟，不截断）" value={budget.maxMinutes} onChange={(value) => setBudget({ ...budget, maxMinutes: value })} /><BudgetInput label="并发数" value={budget.maxConcurrency} onChange={(value) => setBudget({ ...budget, maxConcurrency: value })} /><BudgetInput label="模型费用上限（USD）" value={budget.maxCostUsd} min={0} step={0.5} onChange={(value) => setBudget({ ...budget, maxCostUsd: value })} /></>}
             </div>
-            <CheckLine
+            {acquisitionMode === "project-intel" && <div className="project-intel-policy"><strong>访问频率已固定为保守模式</strong><p>并发 1 · 每页 20 条 · 分页间隔至少 3 秒 · 限流后等待重试。为了保护目标站点，此处不开放提高并发或缩短间隔。</p></div>}
+            {acquisitionMode === "web" && <CheckLine
               checked={ignoreRobots}
               label="模拟真人浏览器访问，忽略 robots.txt 抓取限制"
               meta="仅限公开页面、个人研究用途；遇到反爬拦截时自动切换无头浏览器完整加载页面"
               onChange={() => setIgnoreRobots(!ignoreRobots)}
-            />
+            />}
             <CheckLine
               checked={overseasOnly}
               label="仅统计海外项目，自动排除中国境内项目"
@@ -492,11 +531,8 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
               <h3>本次监测摘要</h3>
               <div><span>字段</span><strong>{fieldIds.length} 项</strong></div>
               <div><span>时间</span><strong>{startDate} 至 {endDate}</strong></div>
-              <div><span>来源</span><strong>{sourceIds.length} 个</strong></div>
-              <div><span>参考项目</span><strong>{referenceRows.length || "无"}</strong></div>
-              <div><span>模型</span><strong>{modelId || "仅规则抽取"}</strong></div>
-              <div><span>外部搜索</span><strong>{searchIds.length} 个</strong></div>
-              <div><span>并行 MCP</span><strong>{mcpIds.length} 个</strong></div>
+              <div><span>来源</span><strong>{acquisitionMode === "project-intel" ? "Project Intel" : `${sourceIds.length} 个`}</strong></div>
+              {acquisitionMode === "project-intel" ? <div><span>访问策略</span><strong>串行低频 · 列表接口</strong></div> : <><div><span>参考项目</span><strong>{referenceRows.length || "无"}</strong></div><div><span>模型</span><strong>{modelId || "仅规则抽取"}</strong></div><div><span>外部搜索</span><strong>{searchIds.length} 个</strong></div><div><span>并行 MCP</span><strong>{mcpIds.length} 个</strong></div></>}
             </div>
           </div>
         )}
@@ -504,7 +540,7 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
           <button className="ghost" disabled={step === 1} onClick={() => setStep((value) => Math.max(1, value - 1))}>← 上一步</button>
           {step < 5
             ? <button className="primary" onClick={() => setStep((value) => Math.min(5, value + 1))}>下一步 →</button>
-            : <button className="primary launch" disabled={busy || !fieldIds.length || !sourceIds.length} onClick={() => void start()}>{busy ? "正在创建…" : "启动监测与爬取"}</button>}
+            : <button className="primary launch" disabled={busy || !fieldIds.length || (acquisitionMode === "web" && !sourceIds.length)} onClick={() => void start()}>{busy ? "正在创建…" : acquisitionMode === "project-intel" ? "启动批量采集" : "启动监测与爬取"}</button>}
         </div>
       </section>
     </div>

@@ -29,6 +29,10 @@ import {
 } from "./lightpanda";
 import { chooseRecallBaseline, recallComparison, type ComparableScan } from "./recall";
 import { runAllSourceJobs } from "./source-scheduler";
+import {
+  fetchProjectIntelRecords, PROJECT_INTEL_SOURCE_ID, PROJECT_INTEL_URL,
+  projectIntelRecordToAssessment, projectIntelRecordToDocument,
+} from "./project-intel";
 
 const HOST = process.env.DPM_API_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.DPM_API_PORT ?? 8765);
@@ -343,12 +347,13 @@ function setProgress(scanId: string, patch: JsonObject, status?: string) {
 
 async function createScan(payload: JsonObject) {
   const request = normalizeScanRequest(payload);
+  const projectIntel = request.acquisitionMode === "project-intel";
   const id = randomUUID();
   const created = now();
   db.prepare("INSERT INTO scans VALUES (?,?,?,?,?,?,?)").run(
     id, JSON.stringify(request), "queued",
     JSON.stringify({
-      sourcesTotal: request.sourceIds.length, sourcesScanned: 0, pagesDiscovered: 0,
+      sourcesTotal: projectIntel ? 1 : request.sourceIds.length, sourcesScanned: 0, pagesDiscovered: 0,
       pagesFetched: 0, fullTextSucceeded: 0, withinRange: 0, outsideRange: 0,
       dateUnknown: 0, dateConflict: 0, projectArticles: 0, nonProjectArticles: 0,
       uncertainArticles: 0, projectMentions: 0, results: 0, failures: 0,
@@ -358,14 +363,16 @@ async function createScan(payload: JsonObject) {
   );
   audit("scan", id, "created", request);
   logScan(id, "info", "lifecycle", "created", "监测任务已创建", {
-    sourceCount: request.sourceIds.length, startDate: request.startDate, endDate: request.endDate,
+    acquisitionMode: request.acquisitionMode, sourceCount: projectIntel ? 1 : request.sourceIds.length,
+    startDate: request.startDate, endDate: request.endDate,
     maxPages: request.budget.maxPages, modelId: request.modelId ?? "rules-only",
   });
-  void runScan(id, request);
+  void (projectIntel ? runProjectIntelScan(id, request) : runScan(id, request));
   return getScan(id);
 }
 
 function normalizeScanRequest(payload: JsonObject): ScanRequest {
+  const acquisitionMode = payload.acquisitionMode === "project-intel" ? "project-intel" : "web";
   const rawBudget = { ...DEFAULT_BUDGET, ...((payload.budget ?? {}) as Partial<ScanBudget>) };
   const startDate = String(payload.startDate ?? "");
   const endDate = String(payload.endDate ?? "");
@@ -388,11 +395,11 @@ function normalizeScanRequest(payload: JsonObject): ScanRequest {
     maxCostUsd: Number(rawBudget.maxCostUsd),
   };
   if (!Number.isFinite(budget.maxCostUsd) || budget.maxCostUsd < 0) throw new Error("模型费用上限必须是非负数");
-  if (sourceIds.length && budget.maxPages < sourceIds.length) {
+  if (acquisitionMode === "web" && sourceIds.length && budget.maxPages < sourceIds.length) {
     throw new Error(`已选择 ${sourceIds.length} 个来源，最大抓取页数至少应为 ${sourceIds.length}，才能为每个来源保留 1 页额度`);
   }
   return {
-    startDate, endDate,
+    acquisitionMode, startDate, endDate,
     fieldIds: Array.isArray(payload.fieldIds) ? payload.fieldIds.map(String) : listFields().map((field) => field.id),
     sourceIds,
     providerId: payload.providerId ? String(payload.providerId) : undefined,
@@ -401,10 +408,126 @@ function normalizeScanRequest(payload: JsonObject): ScanRequest {
     mcpServerIds: Array.isArray(payload.mcpServerIds) ? payload.mcpServerIds.map(String) : [],
     mcpToolNames: Array.isArray(payload.mcpToolNames) ? payload.mcpToolNames.map(String) : [],
     budget,
-    ignoreRobots: payload.ignoreRobots === true,
+    ignoreRobots: acquisitionMode === "web" && payload.ignoreRobots === true,
     overseasOnly: payload.overseasOnly !== false,
     referenceRows: Array.isArray(payload.referenceRows) ? payload.referenceRows as Record<string, unknown>[] : undefined,
   };
+}
+
+async function runProjectIntelScan(scanId: string, request: ScanRequest) {
+  const fields = listFields();
+  const coverage: SourceCoverageState = {
+    sourceId: PROJECT_INTEL_SOURCE_ID, name: "Project Intel", url: PROJECT_INTEL_URL,
+    status: "running", discovered: 0, fetched: 0, succeeded: 0, startedAt: now(),
+  };
+  let imported = 0;
+  let apiPagesFetched = 0;
+  let failures = 0;
+  markScanActive(scanId, true);
+  setProgress(scanId, {
+    sourcesTotal: 1, sourcesScanned: 0, percent: 1,
+    sourceCoverage: { total: 1, settled: 0, succeeded: 0, failed: 0, sources: [coverage] },
+  }, "running");
+  logScan(scanId, "info", "project-intel", "import_started",
+    `开始导入 Project Intel：${request.startDate} 至 ${request.endDate}，最多 ${request.budget.maxPages} 条`, {
+      endpoint: `${PROJECT_INTEL_URL}（公共列表接口）`, pageSize: 20, intervalMs: 3_000,
+      policy: "串行低频访问，只请求列表接口，不逐条访问详情页",
+    });
+  try {
+    const fetched = await fetchProjectIntelRecords({
+      startDate: request.startDate, endDate: request.endDate, maxRecords: request.budget.maxPages,
+      shouldStop: () => scanControlPoint(scanId),
+      onPage: ({ page, total, accepted }) => {
+        apiPagesFetched = page;
+        coverage.discovered = accepted;
+        setProgress(scanId, {
+          pagesDiscovered: accepted, apiPagesFetched: page,
+          percent: Math.min(60, Math.max(2, Math.round((accepted / Math.max(1, request.budget.maxPages)) * 60))),
+          sourceCoverage: { total: 1, settled: 0, succeeded: 0, failed: 0, sources: [coverage] },
+        });
+        logScan(scanId, "info", "project-intel", "page_fetched",
+          `已读取第 ${page} 个列表页，时间范围内累计 ${accepted} 条`, { page, total, accepted });
+      },
+    });
+    coverage.discovered = fetched.records.length;
+    if (fetched.truncated) {
+      logScan(scanId, "warn", "project-intel", "record_limit_reached",
+        `达到本次导入上限 ${request.budget.maxPages} 条；如需更多记录，可提高“最大导入项目数”后新建任务`, {
+          availableTotal: fetched.total, accepted: fetched.records.length,
+        });
+    }
+    for (const record of fetched.records) {
+      await scanControlPoint(scanId);
+      try {
+        const document = projectIntelRecordToDocument(record, request.startDate, request.endDate);
+        saveDocument(scanId, document);
+        let assessment = projectIntelRecordToAssessment(record, fields);
+        if (request.overseasOnly !== false) assessment = filterDomesticMentions(assessment);
+        saveAssessment(scanId, document, assessment, fields, PROJECT_INTEL_URL, false);
+        imported++;
+        coverage.fetched = imported;
+        coverage.succeeded = imported;
+      } catch (error) {
+        failures++;
+        logScan(scanId, "error", "project-intel", "record_failed",
+          `单条项目导入失败，已跳过：${error instanceof Error ? error.message : String(error)}`, {
+            index: String(record._index ?? ""), projectName: String(record.project_name ?? ""),
+          });
+      }
+      if (imported % 10 === 0 || imported + failures === fetched.records.length) {
+        const resultCount = Number((db.prepare("SELECT COUNT(*) AS count FROM projects WHERE scan_id=?")
+          .get(scanId) as { count: number }).count);
+        setProgress(scanId, {
+          pagesFetched: imported + failures, fullTextSucceeded: imported, withinRange: imported,
+          projectArticles: imported, projectMentions: imported, results: resultCount, failures,
+          percent: 60 + Math.round(((imported + failures) / Math.max(1, fetched.records.length)) * 39),
+          sourceCoverage: { total: 1, settled: 0, succeeded: 0, failed: 0, sources: [coverage] },
+        });
+      }
+    }
+    const resultCount = Number((db.prepare("SELECT COUNT(*) AS count FROM projects WHERE scan_id=?")
+      .get(scanId) as { count: number }).count);
+    coverage.status = "completed";
+    coverage.completedAt = now();
+    setProgress(scanId, {
+      pagesDiscovered: fetched.records.length, pagesFetched: imported + failures, apiPagesFetched,
+      fullTextSucceeded: imported, withinRange: imported, projectArticles: imported,
+      projectMentions: imported, results: resultCount, failures, sourcesScanned: 1,
+      projectIntelAvailableTotal: fetched.total, projectIntelTruncated: fetched.truncated,
+      sourceCoverage: { total: 1, settled: 1, succeeded: 1, failed: 0, allSettled: true, sources: [coverage] },
+      percent: 100, completedAt: now(),
+    }, "completed");
+    logScan(scanId, "info", "lifecycle", "completed",
+      `Project Intel 导入完成：读取 ${apiPagesFetched} 个列表页，保存 ${imported} 条记录，形成 ${resultCount} 个项目`, {
+        apiPagesFetched, imported, resultCount, failures, availableTotal: fetched.total,
+      });
+    audit("scan", scanId, "completed", { acquisitionMode: "project-intel", apiPagesFetched, imported, resultCount, failures });
+  } catch (error) {
+    let finalError: unknown = error;
+    try { await scanControlPoint(scanId); } catch (controlError) { finalError = controlError; }
+    const message = finalError instanceof Error ? finalError.message : String(finalError);
+    coverage.status = "failed";
+    coverage.error = message;
+    coverage.completedAt = now();
+    if (finalError instanceof ScanStoppedError) {
+      setProgress(scanId, {
+        stoppedAt: now(), pagesFetched: imported + failures, failures, sourcesScanned: 1,
+        sourceCoverage: { total: 1, settled: 1, succeeded: 0, failed: 1, allSettled: true, sources: [coverage] },
+      }, "stopped");
+      logScan(scanId, "warn", "lifecycle", "stopped", "Project Intel 导入已停止，已保存的数据和日志均保留");
+      audit("scan", scanId, "stopped", { acquisitionMode: "project-intel", imported });
+    } else {
+      setProgress(scanId, {
+        failedAt: now(), pagesFetched: imported + failures, failures: failures + 1, sourcesScanned: 1,
+        sourceCoverage: { total: 1, settled: 1, succeeded: 0, failed: 1, allSettled: true, sources: [coverage] },
+      }, "failed");
+      db.prepare("UPDATE scans SET status='failed', error=?, updated_at=? WHERE id=?").run(message, now(), scanId);
+      logScan(scanId, "error", "lifecycle", "failed", `Project Intel 导入失败：${message}`);
+      audit("scan", scanId, "failed", { acquisitionMode: "project-intel", message, imported });
+    }
+  } finally {
+    markScanActive(scanId, false);
+  }
 }
 
 async function runScan(scanId: string, request: ScanRequest) {
