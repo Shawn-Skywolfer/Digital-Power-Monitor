@@ -77,6 +77,7 @@ export interface ScanBudget {
 }
 
 export interface ScanRequest {
+  acquisitionMode?: "web" | "project-intel";
   startDate: string;
   endDate: string;
   fieldIds: string[];
