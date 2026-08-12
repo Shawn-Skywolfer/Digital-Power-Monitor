@@ -393,6 +393,32 @@ function needsBrowser(html: string, force = false) {
     /enable javascript|javascript is required|id=["'](?:root|app|__next)["'][^>]*>\s*<\/div>/i.test(html);
 }
 
+// 主内容容器与模板噪音的选择器，parseHtml 的正文提取与假厚检测共用，避免两处漂移
+const CONTENT_CONTAINER_SELECTOR = "article,main,[role='main'],.article-content,.article-body,.post-content,.entry-content,.detail-content,.news-content,.TRS_Editor,#zoom,[class*='article_content'],[class*='article-content'],.content";
+const BOILERPLATE_SELECTOR = "script,style,noscript,svg,nav,footer,form,aside,[aria-hidden='true'],.nav,.navbar,.menu,.footer,.sidebar,.related,.recommend,.breadcrumb,.share,.advertisement,.cookie";
+
+/** 假厚页面：静态 HTML 文字量达标（骗过 needsBrowser 的 500 字阈值），但剥掉导航/页脚
+ *  模板后找不到任何实质内容容器，也没有成段文字——厚度全靠菜单目录堆出来。
+ *  正泰新闻详情页实测：bodyText 8000+ 字全是"关于我们/正泰简介"菜单目录，
+ *  JS 注入的正文从未被抓到，模型只能评估导航文字（2026-08 6月扫描漏布尔干项目的根因）。
+ *  只在候选文章抓取路径使用（发现层列表页天然无内容容器，不能套用）；
+ *  误判代价仅是多一次浏览器渲染，结果仍以渲染出的真实正文为准，故阈值适度激进。 */
+function isFakeThickPage(html: string) {
+  const $ = cheerio.load(html);
+  const bodyText = $("body").text().replace(/\s+/g, " ").trim();
+  if (bodyText.length < 2_000) return false;
+  $(BOILERPLATE_SELECTOR).remove();
+  const hasContainer = $(CONTENT_CONTAINER_SELECTOR).toArray()
+    .some((element) => $(element).text().replace(/\s+/g, " ").trim().length >= 120);
+  if (hasContainer) return false;
+  let longestProse = 0;
+  $("body p, body h1, body h2, body h3").each((_, element) => {
+    const length = $(element).text().replace(/\s+/g, " ").trim().length;
+    if (length > longestProse) longestProse = length;
+  });
+  return longestProse < 300;
+}
+
 async function discoveryHtml(url: string, forceBrowser = false) {
   let result: Awaited<ReturnType<typeof fetchText>> | null = null;
   let staticError = "";
@@ -717,9 +743,8 @@ function parseHtml(html: string, responseUrl: string) {
   const datedBlocks = $("time,[datetime]").length + ($("body").text().match(/20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}/g)?.length ?? 0);
   const originalLinkCount = $("a[href]").length;
   const ogArticle = /article/i.test(String($("meta[property='og:type']").attr("content") ?? ""));
-  $("script,style,noscript,svg,nav,footer,form,aside").remove();
-  $("[aria-hidden='true'],.nav,.navbar,.menu,.footer,.sidebar,.related,.recommend,.breadcrumb,.share,.advertisement,.cookie").remove();
-  const candidates = $("article,main,[role='main'],.article-content,.article-body,.post-content,.entry-content,.detail-content,.news-content,.TRS_Editor,#zoom,[class*='article_content'],[class*='article-content'],.content").toArray();
+  $(BOILERPLATE_SELECTOR).remove();
+  const candidates = $(CONTENT_CONTAINER_SELECTOR).toArray();
   let best = $("body");
   let bestScore = -Infinity;
   let extractionMethod = "body-fallback";
@@ -868,7 +893,10 @@ export async function fetchDocument(
       const staticHtml = bytes.toString("utf8");
       // 静态响应命中反爬挑战/拒绝特征（含 200 伪装的验证页）时，直接转浏览器渲染模拟真人访问
       const staticBlocked = Boolean(detectAccessBlock(response.status, "", staticHtml.slice(0, 12_000)));
-      if (needsBrowser(staticHtml, forceBrowser || staticBlocked || [401, 403, 429].includes(response.status))) {
+      const forceRender = forceBrowser || staticBlocked || [401, 403, 429].includes(response.status);
+      const thin = needsBrowser(staticHtml, forceRender);
+      const fakeThick = thin ? false : isFakeThickPage(staticHtml);
+      if (thin || fakeThick) {
         try {
           const dynamic = await renderHtml(response.url);
           bytes = Buffer.from(dynamic.html, "utf8");
@@ -877,6 +905,7 @@ export async function fetchDocument(
           rendered = true;
           fetchMode = "browser";
           renderedBackend = dynamic.backend;
+          if (fakeThick) warnings.push("假厚页面：静态正文实为导航模板，已改用浏览器渲染");
           if (dynamic.backend === "lightpanda") warnings.push("渲染后端：Lightpanda（CDP）");
         } catch (error) {
           warnings.push(`动态渲染失败：${error instanceof Error ? error.message : String(error)}`);

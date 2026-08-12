@@ -1790,7 +1790,8 @@ function count(table: string, where?: string) {
 function createSource(body: JsonObject) {
   const id = randomUUID(); const url = normalizeUrl(String(body.url ?? ""));
   if (!url) throw new Error("网址无效");
-  db.prepare("INSERT INTO sources VALUES (?,?,?,?,?,?,?,?,?)").run(
+  // 必须具名列：位置式 INSERT 在表结构迁移（如补 updated_at 列）后会整体崩掉
+  db.prepare("INSERT INTO sources (id,name,type,coverage,url,country,enabled,rate_limit_ms,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(
     id, String(body.name ?? new URL(url).hostname), String(body.type ?? "网址"), String(body.coverage ?? ""),
     url, String(body.country ?? ""), body.enabled === false ? 0 : 1, Number(body.rateLimitMs ?? 1000), now(),
   );

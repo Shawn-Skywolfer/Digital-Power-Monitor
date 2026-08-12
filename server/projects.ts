@@ -276,8 +276,12 @@ export async function assessArticle(
     : "";
   // 周报/盘点页可能输出多个项目 mention，且推理模型的思考链与正文共享输出额度
   // （实测 deepseek-v4-flash 在 4096/8192 下 reasoning_content 耗尽预算、content 为空或被截断），
-  // 此类页把输出上限抬到 16384、超时抬到 180s
-  const modelOptions = document.pageType === "roundup" ? { maxOutputTokens: 16_384, timeoutMs: 180_000 } : undefined;
+  // 此类页把输出上限抬到 16384、超时抬到 180s。
+  // 普通文章页同样受思考链挤占（2026-08-12 定向扫描 58/101 页模型返回空内容走规则兜底，
+  // 瑞源越南 110MWh 条目因此被规则粗提未落成项目），默认额度也从 4096 抬到 8192。
+  const modelOptions = document.pageType === "roundup"
+    ? { maxOutputTokens: 16_384, timeoutMs: 180_000 }
+    : { maxOutputTokens: 8_192, timeoutMs: 120_000 };
   try {
     const result = await callModel(
       provider,
@@ -503,7 +507,26 @@ function nameSimilarity(left: unknown, right: unknown) {
   const rightTokens = tokens(right);
   const intersection = [...leftTokens].filter((item) => rightTokens.has(item)).length;
   const union = new Set([...leftTokens, ...rightTokens]).size;
-  return union ? intersection / union : 0;
+  const jaccard = union ? intersection / union : 0;
+  // 中文项目名没有分词边界，整名是一个 token，Jaccard 对"沙特哈登…"vs"沙特阿拉伯哈登…"
+  // 这类同物异名直接归零。补字符二元组 Dice 系数兜底：共同子串越多得分越高，
+  // 而不同项目（哈登 vs 阿尔舒巴赫）只有"光伏电站项目"等泛用片段，得分有限。
+  const bigramDice = charBigramDice(a, b);
+  return Math.max(jaccard, bigramDice);
+}
+
+function charBigramDice(a: string, b: string) {
+  if (a.length < 2 || b.length < 2) return 0;
+  const bigrams = (value: string) => {
+    const set = new Set<string>();
+    for (let i = 0; i < value.length - 1; i++) set.add(value.slice(i, i + 2));
+    return set;
+  };
+  const left = bigrams(a);
+  const right = bigrams(b);
+  let shared = 0;
+  for (const item of left) if (right.has(item)) shared++;
+  return (2 * shared) / (left.size + right.size);
 }
 
 function capacitySimilarity(left: Record<string, unknown>, right: Record<string, unknown>) {
@@ -521,13 +544,18 @@ function capacitySimilarity(left: Record<string, unknown>, right: Record<string,
   return compared ? matched / compared : 0;
 }
 
-function projectMatchScore(left: Record<string, unknown>, right: Record<string, unknown>) {
+export function projectMatchScore(left: Record<string, unknown>, right: Record<string, unknown>) {
   const name = nameSimilarity(left.project_name, right.project_name);
   const leftCountry = normalizedText(left.country);
   const rightCountry = normalizedText(right.country);
-  if (leftCountry && rightCountry && leftCountry !== rightCountry) return 0;
+  // 国别门槛不能严格相等：同一国在不同来源里写法不同（"沙特"/"沙特阿拉伯"、
+  // "乌兹"/"乌兹别克斯坦"），互相包含即视为同国。2026-06 扫描里"沙特哈登2吉瓦"与
+  // "沙特阿拉伯哈登2吉瓦"因严格相等被判不同国、跨来源重复项目无法合并。
+  const countryMatch = !leftCountry || !rightCountry ? null :
+    leftCountry === rightCountry || leftCountry.includes(rightCountry) || rightCountry.includes(leftCountry);
+  if (countryMatch === false) return 0;
   let score = name * 0.6;
-  if (leftCountry && rightCountry && leftCountry === rightCountry) score += 0.15;
+  if (countryMatch) score += 0.15;
   score += capacitySimilarity(left, right) * 0.2;
   const ownerLeft = normalizedText(left.owner || left.developer);
   const ownerRight = normalizedText(right.owner || right.developer);
