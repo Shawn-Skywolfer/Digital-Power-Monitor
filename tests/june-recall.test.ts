@@ -112,6 +112,22 @@ before(async () => {
       response.setHeader("Content-Type", "application/pdf");
       return void response.end(Buffer.from("%PDF-1.7 extensionless binary"));
     }
+    // 正泰式假厚页面：bodyText 8000+ 字却全是导航目录（bodyText≥2000、无内容容器、
+    // 无 ≥300 字成段文字），正文由 JS 注入，静态抓取只能拿到菜单
+    if (pathname === "/p/fake-thick") {
+      const catalog = Array.from({ length: 90 }, (_, i) =>
+        `<p class="item"><a href="/about/${i}">关于我们 · 正泰简介 · 数说正泰 · 集团简介 · 正泰荣誉 · 发展历程 ${i}</a></p>`).join("");
+      return void response.end(`<!doctype html><html><head><title>新闻中心-详情</title></head>
+        <body><div id="header-nav"><ul>${catalog}</ul></div><div id="news-detail"></div></body></html>`);
+    }
+    // 正常厚文章页（article 容器内 2000+ 字成段正文），假厚检测不应误伤
+    if (pathname === "/p/normal-article") {
+      const para = "2026年6月，中国企业承建的蒙古国乌兰巴托 50MW/200MWh 储能电站项目举行开工仪式，项目建成后将显著提升当地电网调峰能力，支撑新能源消纳。";
+      return void response.end(`<!doctype html><html><head><title>乌兰巴托储能电站开工</title>
+        <meta property="article:published_time" content="2026-06-15"></head>
+        <body><header><a href="/">首页</a> <a href="/news">新闻</a> <a href="/about">关于</a> <a href="/contact">联系</a></header>
+        <article><h1>乌兰巴托储能电站开工</h1>${`<p>${para}</p>`.repeat(12)}</article></body></html>`);
+    }
     response.statusCode = 404;
     response.end("not found");
   });
@@ -221,4 +237,66 @@ test("binary: 无扩展名栏目页返回 PDF 时按非 HTML 资源快速失败�
   const failure = report.failures.find((f) => f.includes("col3300"));
   assert.ok(failure, "扩展名缺失的二进制栏目页应记录失败");
   assert.match(failure!, /非 HTML 资源/);
+});
+
+test("fakeThick: 导航模板堆出的假厚页面强制浏览器渲染，拿到真实正文", async () => {
+  const crawler = await import("../server/crawler");
+  let renders = 0;
+  crawler.__setBackendRendererForTests("local", async (url) => {
+    renders++;
+    return {
+      html: `<!doctype html><html><head><title>蒙古布尔干 50MW/100MWh 储能项目并网</title>
+        <meta property="article:published_time" content="2026-06-20"></head><body><article><h1>蒙古布尔干储能项目并网</h1>
+        <p>2026年6月20日，正泰新能源承建的蒙古国布尔干 50MW/100MWh 储能电站项目正式并网投运，项目位于布尔干省，是当地电网调峰的重要支撑。</p></article></body></html>`,
+      url, statusCode: 200, backend: "local" as const,
+    };
+  });
+  try {
+    const doc = await crawler.fetchDocument(`${origin}/p/fake-thick`, "src-fake");
+    assert.equal(renders, 1, "假厚页面应触发一次浏览器渲染");
+    assert.equal(doc.fetchMode, "browser");
+    assert.match(doc.text, /布尔干/);
+    assert.ok(!/正泰简介/.test(doc.text), "正文不应再是导航目录");
+    assert.ok(doc.warnings.some((w) => w.includes("假厚页面")), "应记录假厚页面警告");
+  } finally {
+    crawler.__setBackendRendererForTests("local", null);
+  }
+});
+
+test("fakeThick: 正常厚文章页不误触发浏览器渲染", async () => {
+  const crawler = await import("../server/crawler");
+  let renders = 0;
+  crawler.__setBackendRendererForTests("local", async (url) => {
+    renders++;
+    return { html: "<html><body>should not be used</body></html>", url, statusCode: 200, backend: "local" as const };
+  });
+  try {
+    const doc = await crawler.fetchDocument(`${origin}/p/normal-article`, "src-normal");
+    assert.equal(renders, 0, "正常文章页不应触发渲染");
+    assert.equal(doc.fetchMode, "static");
+    assert.match(doc.text, /乌兰巴托/);
+  } finally {
+    crawler.__setBackendRendererForTests("local", null);
+  }
+});
+
+test("dedupe: 国别简写与全称视为同国，跨来源重复项目可合并", async () => {
+  const { projectMatchScore } = await import("../server/projects");
+  const full = { project_name: "沙特阿拉伯哈登2吉瓦光伏电站项目", country: "沙特阿拉伯", pv_capacity_mw: 2000 };
+  const abbr = { project_name: "沙特哈登2吉瓦光伏电站项目", country: "沙特" };
+  assert.ok(projectMatchScore(full, abbr) >= 0.58, `哈登一对应可合并，实际 ${projectMatchScore(full, abbr)}`);
+  const alFull = { project_name: "沙特阿拉伯阿尔舒巴赫2.6吉瓦光伏电站项目", country: "沙特阿拉伯", pv_capacity_mw: 2600 };
+  const alAbbr = { project_name: "沙特阿尔舒巴赫2.6吉瓦光伏电站项目", country: "沙特" };
+  assert.ok(projectMatchScore(alFull, alAbbr) >= 0.58, "阿尔舒巴赫一对应可合并（一侧缺容量也不应阻断）");
+  const uzb = { project_name: "乌兹别克斯坦赛莱斯特储能电站项目", country: "乌兹别克斯坦", storage_capacity_mwh: 300 };
+  const uzbAbbr = { ...uzb, country: "乌兹" };
+  assert.ok(projectMatchScore(uzb, uzbAbbr) >= 0.58, "乌兹/乌兹别克斯坦包含式匹配");
+});
+
+test("dedupe: 不同国别或不同项目不误并", async () => {
+  const { projectMatchScore } = await import("../server/projects");
+  const haden = { project_name: "沙特哈登2吉瓦光伏电站项目", country: "沙特", pv_capacity_mw: 2000 };
+  assert.equal(projectMatchScore(haden, { ...haden, country: "越南" }), 0, "同名不同国必须否决");
+  const shubah = { project_name: "沙特阿尔舒巴赫2.6吉瓦光伏电站项目", country: "沙特", pv_capacity_mw: 2600 };
+  assert.ok(projectMatchScore(haden, shubah) < 0.58, "同国不同项目不应合并");
 });
