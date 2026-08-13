@@ -1545,6 +1545,40 @@ function reviewResult(resultId: string, payload: JsonObject) {
   return mapResult(row);
 }
 
+function approveAllScanResults(scanId: string) {
+  if (!getScan(scanId)) throw new Error("监测任务不存在");
+  const note = "一键确认所有结果";
+  const reviewedAt = now();
+  const projects = db.prepare(`SELECT id,status FROM projects
+    WHERE scan_id=? AND status NOT IN ('approved','auto_approved')`).all(scanId) as Array<{ id: string; status: string }>;
+  const legacyResults = db.prepare(`SELECT id,status FROM results
+    WHERE scan_id=? AND status NOT IN ('approved','auto_approved')`).all(scanId) as Array<{ id: string; status: string }>;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(`UPDATE projects SET status='approved',decision_note=?,updated_at=?
+      WHERE scan_id=? AND status NOT IN ('approved','auto_approved')`).run(note, reviewedAt, scanId);
+    db.prepare(`UPDATE results SET status='approved',decision_note=?,updated_at=?
+      WHERE scan_id=? AND status NOT IN ('approved','auto_approved')`).run(note, reviewedAt, scanId);
+    for (const result of projects) audit("project", result.id, "review", {
+      decision: "approved", note, bulk: true, previousStatus: result.status, scanId,
+    });
+    for (const result of legacyResults) audit("result", result.id, "review", {
+      decision: "approved", note, bulk: true, previousStatus: result.status, scanId,
+    });
+    audit("scan", scanId, "bulk_review", {
+      decision: "approved", projects: projects.length, legacyResults: legacyResults.length,
+    });
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  return {
+    scanId, approved: projects.length + legacyResults.length,
+    projects: projects.length, legacyResults: legacyResults.length,
+  };
+}
+
 function confirmSnapshot(payload: JsonObject) {
   const scanId = String(payload.scanId ?? "");
   const resultIds = Array.isArray(payload.resultIds) ? payload.resultIds.map(String) : getResults(scanId).map((result) => result.id);
@@ -1848,6 +1882,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (req.method === "DELETE" && scanMatch) return sendJson(res, 200, deleteScan(scanMatch[1]));
     const scanResults = url.pathname.match(/^\/api\/scans\/([^/]+)\/results$/);
     if (req.method === "GET" && scanResults) return sendJson(res, 200, getResults(scanResults[1]));
+    const scanApproveAll = url.pathname.match(/^\/api\/scans\/([^/]+)\/approve-all$/);
+    if (req.method === "POST" && scanApproveAll) return sendJson(res, 200, approveAllScanResults(scanApproveAll[1]));
     const scanArticles = url.pathname.match(/^\/api\/scans\/([^/]+)\/articles$/);
     if (req.method === "GET" && scanArticles) return sendJson(res, 200, getArticles(scanArticles[1]));
     const scanDiagnostics = url.pathname.match(/^\/api\/scans\/([^/]+)\/diagnostics$/);

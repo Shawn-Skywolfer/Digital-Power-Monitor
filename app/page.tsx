@@ -560,7 +560,9 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
   const [selectedFailure, setSelectedFailure] = useState("");
   const [repairingBilingual, setRepairingBilingual] = useState("");
   const [assessingPending, setAssessingPending] = useState(false);
+  const [approvingAll, setApprovingAll] = useState(false);
   const filtered = results.filter((result) => filter === "all" || result.status === filter);
+  const unresolvedResults = results.filter((result) => !["approved", "auto_approved"].includes(result.status));
   const visibleLogs = logs.filter((log) => (logLevel === "all" || log.level === logLevel) && (logStage === "all" || log.stage === logStage));
   const failureReasons = (activeScan?.progress.failureReasons && typeof activeScan.progress.failureReasons === "object"
     ? activeScan.progress.failureReasons : {}) as Record<string, number>;
@@ -637,6 +639,28 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
     try { await api(`/api/results/${id}/decision`, { method: "POST", body: JSON.stringify({ decision }) }); notify("审核决定已保存"); await refresh(); }
     catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
   }
+  async function approveAll() {
+    if (!activeScanId || !unresolvedResults.length) return;
+    if (!window.confirm(`确定一键确认当前任务的 ${unresolvedResults.length} 条尚未确认结果吗？\n\n其中包括“待审核”和“低置信度”结果。确认后仍可逐条重新驳回。`)) return;
+    setApprovingAll(true);
+    try {
+      const outcome = await api<{ approved: number }>(`/api/scans/${activeScanId}/approve-all`, {
+        method: "POST", body: "{}",
+      });
+      setExpanded("");
+      notify(outcome.approved ? `已确认 ${outcome.approved} 条结果` : "当前任务没有需要确认的结果");
+      await refresh();
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setApprovingAll(false); }
+  }
+  function toggleResultDetails(id: string) {
+    const opening = expanded !== id;
+    setExpanded(opening ? id : "");
+    if (!opening) return;
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      document.getElementById(`result-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }));
+  }
   async function deep(id: string) {
     notify("已启动定向扩散监测，请稍候");
     try { await api(`/api/results/${id}/deep-expand`, { method: "POST", body: JSON.stringify({ maxQueries: 12, maxPages: 20 }) }); notify("深度扩散已完成，结果已生成新修订"); await refresh(); }
@@ -670,25 +694,30 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
       {(activeScan?.error || Object.keys(failureReasons).length > 0) && <section className="failure-summary panel"><div><span>!</span><strong>{activeScan?.status === "failed" ? "任务失败原因" : "已记录的失败分类"}</strong></div>{activeScan?.error && <p>{activeScan.error}</p>}<div className="failure-chips">{Object.entries(failureReasons).map(([reason, count]) => <button className={selectedFailure === reason ? "active" : ""} key={reason} onClick={() => setSelectedFailure(selectedFailure === reason ? "" : reason)}>{failureReasonLabel(reason)} · {count}</button>)}</div>{selectedFailure && <div className="failure-detail"><div className="failure-detail-head"><div><strong>{failureReasonLabel(selectedFailure)}明细</strong><p>显示可审计原始错误、来源和网址，可据此修订信息源或生成 Skill 迭代建议。</p></div><div><button className="ghost small" onClick={onOpenSources}>修改信息源</button><button className="primary small" onClick={onOpenSkill}>交给 Skill 优化</button></div></div>{failureDetails.length ? <div className="failure-detail-list">{failureDetails.map((log) => <details key={log.id}><summary><span>{log.context.source ? String(log.context.source) : log.stage}</span><strong>{log.message.split("\n")[0]}</strong><time>{new Date(log.createdAt).toLocaleString("zh-CN")}</time></summary><dl><div><dt>阶段/事件</dt><dd>{log.stage} / {log.event}</dd></div>{Boolean(log.context.url) && <div><dt>网址</dt><dd><a href={String(log.context.url)} target="_blank" rel="noreferrer">{String(log.context.url)}</a></dd></div>}{log.context.attempts != null && <div><dt>尝试次数</dt><dd>{String(log.context.attempts)}</dd></div>}{Boolean(log.context.method) && <div><dt>采集方式</dt><dd>{String(log.context.method)}</dd></div>}<div><dt>完整错误</dt><dd><pre>{log.message}</pre></dd></div></dl></details>)}</div> : <p className="muted">当前日志中没有与该分类逐条对应的记录；可在下方完整日志中继续筛选。</p>}</div>}</section>}
       {zeroResultInsight && <section className="zero-result-insight panel"><strong>为什么没有结果</strong><p>{zeroResultInsight}</p></section>}
       <section className="panel">
-        <div className="results-toolbar">
+        <div className="results-toolbar" id="structured-results">
           <div><h2>结构化结果</h2><p>点击一行查看字段证据、候选链接与冲突。</p></div>
-          <div className="filters">
-            {[["all","全部"],["auto_approved","自动通过"],["approved","已确认"],["review","待审核"],["rejected","低置信度"]].map(([id,label]) => <button className={filter === id ? "active" : ""} key={id} onClick={() => setFilter(id)}>{label}</button>)}
+          <div className="results-toolbar-actions">
+            <button className="primary small approve-all" disabled={!activeScanId || !unresolvedResults.length || approvingAll} onClick={() => void approveAll()}>
+              {approvingAll ? "正在确认…" : unresolvedResults.length ? `✓ 一键确认所有结果（${unresolvedResults.length}）` : "✓ 所有结果已确认"}
+            </button>
+            <div className="filters">
+              {[["all","全部"],["auto_approved","自动通过"],["approved","已确认"],["review","待审核"],["rejected","低置信度"]].map(([id,label]) => <button className={filter === id ? "active" : ""} key={id} onClick={() => { setFilter(id); setExpanded(""); }}>{label}</button>)}
+            </div>
           </div>
         </div>
         {!activeScanId && <Empty text="请先选择一个监测任务。" />}
         {activeScanId && filtered.length === 0 && <Empty text={activeScan?.status === "running" ? "监测仍在进行，结果会自动出现。" : "该筛选条件下没有结果。"} />}
         <div className="result-list">
           {filtered.map((result) => (
-            <article className={expanded === result.id ? "result-card expanded" : "result-card"} key={result.id}>
-              <button className="result-main" onClick={() => setExpanded(expanded === result.id ? "" : result.id)}>
+            <article id={`result-${result.id}`} className={expanded === result.id ? "result-card expanded" : "result-card"} key={result.id}>
+              <button className="result-main" aria-expanded={expanded === result.id} aria-controls={`result-detail-${result.id}`} onClick={() => toggleResultDetails(result.id)}>
                 <span className={`score score-${Math.floor(result.score / 20)}`}>{Math.round(result.score)}</span>
                 <div className="result-title"><strong>{String(result.fields.project_name ?? "未命名项目")} {result.generatedFields?.includes("project_name") && <em className="generated-badge">系统提炼</em>}{isForeignResult(result) && <em className="bilingual-badge">中英双语 · {(result.sourceLanguage ?? "原文").toUpperCase()}</em>}</strong>{isForeignResult(result) && <small className="original-title" lang={result.sourceLanguage === "foreign" ? undefined : result.sourceLanguage}>原文：{result.originalFields?.project_name || "网页未提供独立项目名，中文名称由系统基于原文证据提炼"}</small>}<p>{String(result.fields.country ?? "")} · {capacityLabel(result.fields)} · 修订 {result.revision}</p></div>
                 <StatusPill status={result.status} />
                 <span className="chevron">{expanded === result.id ? "⌃" : "⌄"}</span>
               </button>
               {expanded === result.id && (
-                <div className="result-detail">
+                <div className="result-detail" id={`result-detail-${result.id}`}>
                   <div className="evidence-grid">
                     <section><h3>{isForeignResult(result) ? "字段双语对照与验证" : "字段与证据"}</h3>{fields.filter((field) => hasDisplayValue(result.fields[field.id]) || hasDisplayValue(result.originalFields?.[field.id])).map((field) => <div className="evidence-row" key={field.id}><span>{field.label.replace("\n"," ")}</span><strong>{isForeignResult(result) && <small className="language-label">中文提炼</small>}<b>{String(result.fields[field.id] ?? "待补齐")}</b>{result.generatedFields?.includes(field.id) && <em className="generated-badge">提炼</em>}{isForeignResult(result) ? <small lang={result.sourceLanguage === "foreign" ? undefined : result.sourceLanguage}>原文（{(result.sourceLanguage ?? "original").toUpperCase()}）：{result.originalFields?.[field.id] || "原文未单独给出"}</small> : bilingualOriginal(result, field.id) && <small>原文：{result.originalFields?.[field.id]}</small>}</strong><div className="bilingual-evidence"><p><i>原文证据</i><EvidenceText text={result.evidence[field.id] || "该字段暂无截取证据，建议人工查看原文。"} values={evidenceValues(result, field.id)} /></p>{isForeignResult(result) ? <p className={result.evidenceTranslations?.[field.id] ? "translation" : "translation missing"}><i>中文验证</i>{result.evidenceTranslations?.[field.id] || "翻译待自动补齐；当前结果应人工复核"}</p> : result.evidenceTranslations?.[field.id] && result.evidenceTranslations[field.id] !== result.evidence[field.id] && <p className="translation"><i>中文验证</i>{result.evidenceTranslations[field.id]}</p>}{result.unitChecks?.[field.id] && <p className={result.unitChecks[field.id].startsWith("未通过") ? "unit-check bad" : "unit-check"}><i>单位核验</i>{result.unitChecks[field.id]}</p>}</div></div>)}</section>
                     <section><h3>来源与判断</h3><a className="source-link" href={result.primaryUrl || undefined} target="_blank" rel="noreferrer">{result.primaryUrl || "尚未找到可靠主链接"}</a><p className="muted">候选页面：{result.candidateUrls.length} 个</p>{result.conflicts.length > 0 && <div className="conflict-box"><strong>需要注意</strong>{result.conflicts.map((item) => <p key={item}>• {item}</p>)}</div>}</section>
@@ -1197,27 +1226,32 @@ function ExportsView({ activeScan, results, fields, notify, onError }: { activeS
   const [includeFlagged, setIncludeFlagged] = useState(false);
   const [exported, setExported] = useState<{ location: string; files: string[]; verified: boolean } | null>(null);
   const [targetDirectory, setTargetDirectory] = useState<ExportTarget | null>(null);
+  const [choosingDirectory, setChoosingDirectory] = useState(false);
   const unresolved = results.filter((result) => !["approved","auto_approved"].includes(result.status)).length;
   async function chooseDirectory() {
+    if (choosingDirectory) return;
+    setChoosingDirectory(true);
     try {
-      try {
-        const selected = await api<{ cancelled: boolean; token?: string; path?: string; name?: string }>("/api/export-directories/pick", { method: "POST", body: "{}" });
-        if (selected.cancelled) return;
-        if (!selected.token || !selected.path || !selected.name) throw new Error("服务端未返回有效的文件夹授权");
-        setTargetDirectory({ mode: "native", token: selected.token, path: selected.path, name: selected.name });
-        return;
-      } catch (nativeCause) {
-        const browserWindow = window as unknown as { showDirectoryPicker?: (options?: { mode: "readwrite" }) => Promise<LocalDirectoryHandle> };
-        const picker = browserWindow.showDirectoryPicker?.bind(window);
-        if (!picker) throw nativeCause;
-        const handle = await picker({ mode: "readwrite" });
-        if (handle.requestPermission && await handle.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("没有获得目标文件夹的写入权限");
-        setTargetDirectory({ mode: "browser", handle, path: handle.name, name: handle.name });
+      const browserWindow = window as unknown as { showDirectoryPicker?: (options?: { mode: "readwrite" }) => Promise<LocalDirectoryHandle> };
+      const picker = browserWindow.showDirectoryPicker?.bind(window);
+      if (picker) {
+        try {
+          const handle = await picker({ mode: "readwrite" });
+          if (handle.requestPermission && await handle.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("没有获得目标文件夹的写入权限");
+          setTargetDirectory({ mode: "browser", handle, path: handle.name, name: handle.name });
+          return;
+        } catch (browserCause) {
+          if (browserCause instanceof DOMException && browserCause.name === "AbortError") return;
+        }
       }
+      const selected = await api<{ cancelled: boolean; token?: string; path?: string; name?: string }>("/api/export-directories/pick", { method: "POST", body: "{}" });
+      if (selected.cancelled) return;
+      if (!selected.token || !selected.path || !selected.name) throw new Error("服务端未返回有效的文件夹授权");
+      setTargetDirectory({ mode: "native", token: selected.token, path: selected.path, name: selected.name });
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === "AbortError") return;
       onError(cause instanceof Error ? cause.message : String(cause));
-    }
+    } finally { setChoosingDirectory(false); }
   }
   async function copyToTarget(downloads: Record<string, ExportDownload>) {
     if (!targetDirectory || targetDirectory.mode !== "browser") return [];
@@ -1265,9 +1299,9 @@ function ExportsView({ activeScan, results, fields, notify, onError }: { activeS
       <section className="panel export-summary">
         <p className="eyebrow">确认快照</p><h2>{activeScan ? `任务 ${activeScan.id.slice(0,8)}` : "尚未选择任务"}</h2>
         <div className="export-metrics"><div><strong>{results.length}</strong><span>全部结果</span></div><div><strong>{results.length-unresolved}</strong><span>已确认</span></div><div><strong>{unresolved}</strong><span>待处理</span></div></div>
-        <div className="export-target"><div><strong>导出目标文件夹</strong><p>{targetDirectory ? targetDirectory.path : "未选择，将使用应用默认 outputs 目录"}</p></div><button className="ghost small" onClick={() => void chooseDirectory()}>{targetDirectory ? "重新选择" : "选择文件夹"}</button></div>
+        <div className={choosingDirectory ? "export-target choosing" : "export-target"}><div><strong>导出目标文件夹</strong><p aria-live="polite">{choosingDirectory ? "正在等待系统文件夹窗口，请在弹出的窗口中完成选择…" : targetDirectory ? targetDirectory.path : "未选择，将使用应用默认 outputs 目录"}</p></div><button className="ghost small" disabled={choosingDirectory} onClick={() => void chooseDirectory()}>{choosingDirectory ? "等待选择…" : targetDirectory ? "重新选择" : "选择文件夹"}</button></div>
         {unresolved > 0 && <label className="include-flagged"><input type="checkbox" checked={includeFlagged} onChange={(e) => setIncludeFlagged(e.target.checked)} /><div><strong>将存疑记录一并导出</strong><p>这些记录会保留状态、评分和冲突说明。</p></div></label>}
-        <button className="primary full export-button" disabled={!activeScan || !results.length || (unresolved > 0 && !includeFlagged)} onClick={() => void create()}>确认快照并一键导出</button>
+        <button className="primary full export-button" disabled={choosingDirectory || !activeScan || !results.length || (unresolved > 0 && !includeFlagged)} onClick={() => void create()}>确认快照并一键导出</button>
       </section>
       <section className="panel">
         <PanelHeader title="交付内容" subtitle="同一个快照生成四种一致的文件" />

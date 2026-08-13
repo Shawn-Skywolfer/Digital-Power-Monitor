@@ -139,3 +139,29 @@ test("assess-pending endpoint recovers assessments for interrupted scans", async
   }
   assert.ok(restored >= 2, `补跑后应恢复至少 2 条结果，实际 ${restored}`);
 });
+
+test("approve-all endpoint confirms every unresolved result in one audited operation", async () => {
+  const scan = await createAprilScan();
+  for (let attempt = 0; attempt < 150; attempt++) {
+    const state = (await (await fetch(`${API}/api/scans/${scan.id}`)).json()) as ScanState;
+    if (["completed", "failed", "stopped"].includes(state.status)) break;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  const before = (await (await fetch(`${API}/api/scans/${scan.id}/results`)).json()) as Array<{ id: string; status: string }>;
+  const unresolved = before.filter((result) => !["approved", "auto_approved"].includes(result.status));
+  assert.ok(unresolved.length >= 1, "测试任务应至少包含一条尚未确认的结果");
+
+  const response = await fetch(`${API}/api/scans/${scan.id}/approve-all`, { method: "POST", body: "{}" });
+  assert.equal(response.status, 200);
+  const outcome = (await response.json()) as { approved: number };
+  assert.equal(outcome.approved, unresolved.length);
+  const afterApproval = (await (await fetch(`${API}/api/scans/${scan.id}/results`)).json()) as Array<{ status: string }>;
+  assert.ok(afterApproval.every((result) => ["approved", "auto_approved"].includes(result.status)));
+
+  const second = await fetch(`${API}/api/scans/${scan.id}/approve-all`, { method: "POST", body: "{}" });
+  assert.equal(((await second.json()) as { approved: number }).approved, 0, "重复操作应保持幂等");
+  const { db } = await import("../server/db");
+  const auditRow = db.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE entity_type='scan' AND entity_id=? AND action='bulk_review'")
+    .get(scan.id) as { count: number };
+  assert.equal(auditRow.count, 2, "每次批量操作都应留下任务级审计记录");
+});
