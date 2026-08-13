@@ -6,7 +6,7 @@ import ExcelJS from "exceljs";
 import { db, DATA_DIR, audit, jsonParse, listFields, listSources, now } from "./db";
 import { vault } from "./vault";
 import type {
-  CrawledDocument, JsonObject, ModelProviderRecord, ResultRecord,
+  ArticleAssessment, CrawledDocument, JsonObject, ModelProviderRecord, ResultRecord,
   ScanBudget, ScanRequest, SearchProviderRecord, SourceRecord,
 } from "./types";
 import { listProviderModels, searchWeb, testProvider } from "./providers";
@@ -33,6 +33,11 @@ import {
   fetchProjectIntelRecords, PROJECT_INTEL_SOURCE_ID, PROJECT_INTEL_URL,
   projectIntelRecordToAssessment, projectIntelRecordToDocument,
 } from "./project-intel";
+import {
+  DAJIALA_DETAIL_PRICE_CNY, DAJIALA_HISTORY_ESTIMATE_CNY, DAJIALA_BASE_URL,
+  dajialaArticleToDocument, fetchDajialaAccountHistoryPage, fetchDajialaArticleDetail, testDajialaConnection,
+  type DajialaArticle,
+} from "./dajiala";
 
 const HOST = process.env.DPM_API_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.DPM_API_PORT ?? 8765);
@@ -89,6 +94,7 @@ function mapSearchProvider(row: Record<string, unknown>): SearchProviderRecord {
     headers: jsonParse<Record<string, string>>(row.headers_json, {}),
     config: jsonParse<JsonObject>(row.config_json, {}), enabled: Boolean(row.enabled),
     hasSecret: vault.has(`search:${id}`),
+    hasVerifycode: vault.has(`search:${id}:verifycode`),
   };
 }
 
@@ -348,6 +354,7 @@ function setProgress(scanId: string, patch: JsonObject, status?: string) {
 async function createScan(payload: JsonObject) {
   const request = normalizeScanRequest(payload);
   const projectIntel = request.acquisitionMode === "project-intel";
+  const wechat = request.acquisitionMode === "wechat";
   const id = randomUUID();
   const created = now();
   db.prepare("INSERT INTO scans VALUES (?,?,?,?,?,?,?)").run(
@@ -367,12 +374,12 @@ async function createScan(payload: JsonObject) {
     startDate: request.startDate, endDate: request.endDate,
     maxPages: request.budget.maxPages, modelId: request.modelId ?? "rules-only",
   });
-  void (projectIntel ? runProjectIntelScan(id, request) : runScan(id, request));
+  void (projectIntel ? runProjectIntelScan(id, request) : wechat ? runWechatScan(id, request) : runScan(id, request));
   return getScan(id);
 }
 
 function normalizeScanRequest(payload: JsonObject): ScanRequest {
-  const acquisitionMode = payload.acquisitionMode === "project-intel" ? "project-intel" : "web";
+  const acquisitionMode = payload.acquisitionMode === "project-intel" ? "project-intel" : payload.acquisitionMode === "wechat" ? "wechat" : "web";
   const rawBudget = { ...DEFAULT_BUDGET, ...((payload.budget ?? {}) as Partial<ScanBudget>) };
   const startDate = String(payload.startDate ?? "");
   const endDate = String(payload.endDate ?? "");
@@ -398,6 +405,30 @@ function normalizeScanRequest(payload: JsonObject): ScanRequest {
   if (acquisitionMode === "web" && sourceIds.length && budget.maxPages < sourceIds.length) {
     throw new Error(`已选择 ${sourceIds.length} 个来源，最大抓取页数至少应为 ${sourceIds.length}，才能为每个来源保留 1 页额度`);
   }
+  const rawWechat = payload.wechat && typeof payload.wechat === "object" && !Array.isArray(payload.wechat)
+    ? payload.wechat as JsonObject : {};
+  const wechatProviderId = payload.wechatProviderId ? String(payload.wechatProviderId) : undefined;
+  let wechat: ScanRequest["wechat"];
+  if (acquisitionMode === "wechat") {
+    const outputMode = rawWechat.outputMode === "fulltext" ? "fulltext" : "projects";
+    const maxApiCostCny = Number(rawWechat.maxApiCostCny ?? 10);
+    if (!Number.isFinite(maxApiCostCny) || maxApiCostCny < DAJIALA_HISTORY_ESTIMATE_CNY || maxApiCostCny > 100_000) {
+      throw new Error("大家啦 API 费用上限无效");
+    }
+    if (!sourceIds.length) throw new Error("请至少选择一个已导入的微信公众号账号");
+    const sourceMap = new Map(listSources().map((source) => [source.id, source]));
+    const invalidSources = sourceIds.filter((id) => sourceMap.get(id)?.type !== "微信公众号");
+    if (invalidSources.length) throw new Error("微信监测只能选择公众号账号来源");
+    if (!wechatProviderId) throw new Error("请选择已配置的大家啦微信 API");
+    const wechatProvider = getSearchProvider(wechatProviderId);
+    if (!wechatProvider || !wechatProvider.enabled || wechatProvider.kind !== "dajiala" || !wechatProvider.hasSecret) throw new Error("大家啦微信 API 未配置或缺少 API Key");
+    if (outputMode === "projects") {
+      if (!payload.providerId || !payload.modelId) throw new Error("项目字段分析模式必须选择可用的大模型供应商和模型");
+      const modelProvider = getProvider(String(payload.providerId));
+      if (!modelProvider || !modelProvider.enabled || !modelProvider.hasSecret) throw new Error("所选大模型供应商不可用或缺少 API Key");
+    }
+    wechat = { outputMode, maxApiCostCny };
+  }
   return {
     acquisitionMode, startDate, endDate,
     fieldIds: Array.isArray(payload.fieldIds) ? payload.fieldIds.map(String) : listFields().map((field) => field.id),
@@ -405,6 +436,8 @@ function normalizeScanRequest(payload: JsonObject): ScanRequest {
     providerId: payload.providerId ? String(payload.providerId) : undefined,
     modelId: payload.modelId ? String(payload.modelId) : undefined,
     searchProviderIds: Array.isArray(payload.searchProviderIds) ? payload.searchProviderIds.map(String) : [],
+    wechatProviderId,
+    wechat,
     mcpServerIds: Array.isArray(payload.mcpServerIds) ? payload.mcpServerIds.map(String) : [],
     mcpToolNames: Array.isArray(payload.mcpToolNames) ? payload.mcpToolNames.map(String) : [],
     budget,
@@ -524,6 +557,237 @@ async function runProjectIntelScan(scanId: string, request: ScanRequest) {
       db.prepare("UPDATE scans SET status='failed', error=?, updated_at=? WHERE id=?").run(message, now(), scanId);
       logScan(scanId, "error", "lifecycle", "failed", `Project Intel 导入失败：${message}`);
       audit("scan", scanId, "failed", { acquisitionMode: "project-intel", message, imported });
+    }
+  } finally {
+    markScanActive(scanId, false);
+  }
+}
+
+async function assessWechatFullDocument(
+  document: CrawledDocument,
+  fields: ReturnType<typeof listFields>,
+  provider: ModelProviderRecord | undefined,
+  modelId: string | undefined,
+) {
+  const chunkSize = 82_000;
+  const overlap = 2_000;
+  if (document.text.length <= 95_000 || !provider || !modelId) return assessArticle(document, fields, provider, modelId);
+  const bodyMarker = document.text.indexOf("正文：");
+  const metadata = document.text.slice(0, Math.min(1_500, bodyMarker >= 0 ? bodyMarker + 3 : 1_500));
+  const chunks: string[] = [];
+  for (let start = 0; start < document.text.length; start += chunkSize - overlap) {
+    chunks.push(`${metadata}\n\n【全文分段 ${chunks.length + 1}】\n${document.text.slice(start, start + chunkSize)}`);
+    if (start + chunkSize >= document.text.length) break;
+  }
+  const assessments: ArticleAssessment[] = [];
+  let modelUsed = false;
+  const errors: string[] = [];
+  for (let index = 0; index < chunks.length; index++) {
+    const analyzed = await assessArticle({
+      ...document, id: `${document.id}:chunk:${index + 1}`, text: chunks[index], markdown: chunks[index],
+    }, fields, provider, modelId);
+    assessments.push(analyzed.assessment);
+    modelUsed ||= analyzed.modelUsed;
+    if (analyzed.error) errors.push(`第 ${index + 1} 段：${analyzed.error}`);
+  }
+  const seen = new Set<string>();
+  const mentions = assessments.flatMap((assessment) => assessment.mentions).filter((mention) => {
+    const signature = JSON.stringify([
+      mention.fields.project_name ?? "", mention.fields.country ?? "", mention.fields.address ?? "",
+      mention.fields.pv_capacity_mw ?? "", mention.fields.storage_power_mw ?? "", mention.fields.storage_capacity_mwh ?? "",
+      mention.fields.owner ?? mention.fields.developer ?? "",
+    ]).toLowerCase();
+    if (seen.has(signature)) return false;
+    seen.add(signature);
+    return true;
+  });
+  const projectAssessments = assessments.filter((assessment) => assessment.classification === "project_report");
+  const uncertain = assessments.some((assessment) => assessment.classification === "uncertain");
+  return {
+    assessment: {
+      classification: mentions.length ? "project_report" : uncertain ? "uncertain" : "non_project",
+      confidence: projectAssessments.length
+        ? Math.max(...projectAssessments.map((assessment) => assessment.confidence))
+        : Math.max(...assessments.map((assessment) => assessment.confidence), 0),
+      reasoning: `已将 ${document.text.length.toLocaleString("zh-CN")} 字全文分为 ${chunks.length} 段理解并合并去重。${assessments.map((assessment, index) => `第${index + 1}段：${assessment.reasoning}`).join("；")}`.slice(0, 12_000),
+      sourceLanguage: assessments.find((assessment) => assessment.sourceLanguage)?.sourceLanguage,
+      mentions,
+    } satisfies ArticleAssessment,
+    modelUsed,
+    error: errors.join("；"),
+  };
+}
+
+async function runWechatScan(scanId: string, request: ScanRequest) {
+  const config = request.wechat;
+  const searchProvider = request.wechatProviderId ? getSearchProvider(request.wechatProviderId) : undefined;
+  const provider = config?.outputMode === "projects" ? getProvider(request.providerId) : undefined;
+  if (!config || !searchProvider || searchProvider.kind !== "dajiala") throw new Error("微信监测任务配置不完整");
+  const credentials = {
+    key: vault.get(`search:${searchProvider.id}`),
+    verifycode: vault.get(`search:${searchProvider.id}:verifycode`),
+  };
+  const baseUrl = (searchProvider.endpoint || DAJIALA_BASE_URL).replace(/\/$/, "");
+  const fields = listFields();
+  const sourceMap = new Map(listSources().map((source) => [source.id, source]));
+  const selectedSources = request.sourceIds.map((id) => sourceMap.get(id)).filter(Boolean) as SourceRecord[];
+  const coverage = selectedSources.map<SourceCoverageState>((source) => ({
+    sourceId: source.id, name: source.name, url: source.url, status: "pending",
+    discovered: 0, fetched: 0, succeeded: 0,
+  }));
+  let apiCostCny = 0;
+  let apiPagesFetched = 0;
+  let examined = 0;
+  let availableTotal = 0;
+  let remainMoney: number | undefined;
+  let fetched = 0;
+  let fullTextSucceeded = 0;
+  let withinRange = 0;
+  let outsideRange = 0;
+  let dateUnknown = 0;
+  let projectArticles = 0;
+  let nonProjectArticles = 0;
+  let uncertainArticles = 0;
+  let projectMentions = 0;
+  let modelExtractions = 0;
+  let failures = 0;
+  let costLimited = false;
+  markScanActive(scanId, true);
+  setProgress(scanId, {
+    sourcesTotal: coverage.length, sourcesScanned: 0, percent: 1, dajialaApiCostCny: 0,
+    wechatOutputMode: config.outputMode,
+    sourceCoverage: { total: coverage.length, settled: 0, succeeded: 0, failed: 0, sources: coverage },
+  }, "running");
+  logScan(scanId, "info", "wechat", "scan_started",
+    `开始监测 ${selectedSources.length} 个公众号：${request.startDate} 至 ${request.endDate}，最多归档 ${request.budget.maxPages} 篇文章`, {
+      outputMode: config.outputMode, maxApiCostCny: config.maxApiCostCny, modelId: request.modelId,
+      policy: "按已导入账号调用历史接口；串行获取全文，接口调用不超过文档标注的 QPS 上限",
+    });
+  try {
+    for (let sourceIndex = 0; sourceIndex < selectedSources.length && fetched < request.budget.maxPages && !costLimited; sourceIndex++) {
+      const source = selectedSources[sourceIndex];
+      const sourceCoverage = coverage[sourceIndex];
+      sourceCoverage.status = "running";
+      sourceCoverage.startedAt = now();
+      try {
+        const parsed = new URL(source.url);
+        const account = parsed.protocol === "wechat:"
+          ? { ghid: decodeURIComponent(parsed.pathname.slice(1)) }
+          : { url: source.url };
+        let page = 1;
+        let offset = "";
+        let isEnd = false;
+        let olderThanRange = false;
+        while (!isEnd && fetched < request.budget.maxPages && !olderThanRange) {
+          await scanControlPoint(scanId);
+          if (apiCostCny + DAJIALA_HISTORY_ESTIMATE_CNY > config.maxApiCostCny + 1e-9) { costLimited = true; break; }
+          const history = await fetchDajialaAccountHistoryPage({ credentials, account, offset, baseUrl });
+          apiPagesFetched++;
+          apiCostCny += history.costCny;
+          remainMoney = history.remainMoney ?? remainMoney;
+          offset = history.nextOffset;
+          isEnd = history.isEnd || !history.nextOffset;
+          availableTotal += history.totalArticles;
+          examined += history.articles.length;
+          const dated = history.articles.map((article) => article.publishedAt).filter((value): value is string => Boolean(value));
+          olderThanRange = dated.length > 0 && dated.every((date) => date < request.startDate);
+          const candidates = history.articles.filter((article) => article.publishedAt && article.publishedAt >= request.startDate && article.publishedAt <= request.endDate);
+          sourceCoverage.discovered += candidates.length;
+          logScan(scanId, "info", "wechat", "account_history_page_fetched",
+            `${source.name}：历史第 ${page} 页，时间范围内 ${candidates.length} 篇`, { account: source.name, page, isEnd, examined: history.articles.length });
+          for (const item of candidates) {
+            if (fetched >= request.budget.maxPages) break;
+            await scanControlPoint(scanId);
+            if (apiCostCny + DAJIALA_DETAIL_PRICE_CNY > config.maxApiCostCny + 1e-9) { costLimited = true; break; }
+            try {
+              const detail = await fetchDajialaArticleDetail({ credentials, url: item.url, baseUrl });
+              apiCostCny += detail.costCny;
+              remainMoney = detail.remainMoney ?? remainMoney;
+              const article: DajialaArticle = {
+                ...item, ...detail.article,
+                title: detail.article.title || item.title,
+                publishedAt: item.publishedAt || detail.article.publishedAt,
+                accountName: detail.article.accountName || history.accountName || source.name,
+                accountId: detail.article.accountId || history.accountId,
+                ghid: detail.article.ghid || history.ghid,
+                content: detail.article.content,
+              };
+              const document = dajialaArticleToDocument(article, request.startDate, request.endDate, source.id);
+              saveDocument(scanId, document);
+              fetched++;
+              sourceCoverage.fetched++;
+              if (document.text.length >= 200) fullTextSucceeded++;
+              if (document.dateStatus === "outside_range") outsideRange++;
+              else if (document.dateStatus === "date_unknown") dateUnknown++;
+              else withinRange++;
+              if (config.outputMode === "projects") {
+                const analyzed = await assessWechatFullDocument(document, fields, provider, request.modelId);
+                if (request.overseasOnly !== false) analyzed.assessment = filterDomesticMentions(analyzed.assessment);
+                if (analyzed.modelUsed) modelExtractions++;
+                if (analyzed.assessment.classification === "project_report") projectArticles++;
+                else if (analyzed.assessment.classification === "non_project") nonProjectArticles++;
+                else uncertainArticles++;
+                projectMentions += analyzed.assessment.mentions.length;
+                saveAssessment(scanId, document, analyzed.assessment, fields, article.url, analyzed.modelUsed);
+              }
+              sourceCoverage.succeeded++;
+            } catch (error) {
+              failures++;
+              logScan(scanId, "error", "wechat", "article_processing_failed", `文章全文获取或处理失败：${error instanceof Error ? error.message : String(error)}`, { account: source.name, url: item.url });
+            }
+            await new Promise((resolve) => setTimeout(resolve, 250));
+          }
+          page++;
+          if (!isEnd && !olderThanRange && !costLimited) await new Promise((resolve) => setTimeout(resolve, 1_000));
+        }
+        sourceCoverage.status = "completed";
+      } catch (error) {
+        failures++;
+        sourceCoverage.status = "failed";
+        sourceCoverage.error = error instanceof Error ? error.message : String(error);
+        logScan(scanId, "error", "wechat", "account_history_failed", `${source.name} 历史内容获取失败：${sourceCoverage.error}`, { sourceId: source.id });
+      }
+      sourceCoverage.completedAt = now();
+      const settled = coverage.filter((item) => ["completed", "failed"].includes(item.status)).length;
+      const resultCount = Number((db.prepare("SELECT COUNT(*) AS count FROM projects WHERE scan_id=?").get(scanId) as { count: number }).count);
+      setProgress(scanId, {
+        sourcesScanned: settled, pagesDiscovered: coverage.reduce((sum, item) => sum + item.discovered, 0), pagesFetched: fetched,
+        fullTextSucceeded, withinRange, outsideRange, dateUnknown, projectArticles, nonProjectArticles, uncertainArticles,
+        projectMentions, modelExtractions, results: resultCount, failures, apiPagesFetched, wechatArticlesExamined: examined,
+        dajialaApiCostCny: apiCostCny, dajialaRemainMoney: remainMoney,
+        percent: Math.min(99, Math.round((settled / Math.max(1, coverage.length)) * 100)),
+        sourceCoverage: { total: coverage.length, settled, succeeded: coverage.filter((item) => item.status === "completed").length, failed: coverage.filter((item) => item.status === "failed").length, sources: coverage },
+      });
+    }
+    if (costLimited) logScan(scanId, "warn", "wechat", "api_cost_limit_reached", "已达到大家啦 API 费用上限，后续账号或文章未再调用", { apiCostCny, maxApiCostCny: config.maxApiCostCny });
+    const resultCount = Number((db.prepare("SELECT COUNT(*) AS count FROM projects WHERE scan_id=?").get(scanId) as { count: number }).count);
+    for (const item of coverage.filter((entry) => entry.status === "pending")) item.status = "completed";
+    setProgress(scanId, {
+      pagesDiscovered: coverage.reduce((sum, item) => sum + item.discovered, 0), pagesFetched: fetched, fullTextSucceeded, withinRange, outsideRange,
+      dateUnknown, projectArticles, nonProjectArticles, uncertainArticles, projectMentions, modelExtractions,
+      results: resultCount, failures, apiPagesFetched, wechatArticlesExamined: examined,
+      wechatAvailableTotal: availableTotal, dajialaApiCostCny: apiCostCny, dajialaRemainMoney: remainMoney,
+      sourcesScanned: coverage.length, percent: 100, completedAt: now(),
+      sourceCoverage: { total: coverage.length, settled: coverage.length, succeeded: coverage.filter((item) => item.status === "completed").length, failed: coverage.filter((item) => item.status === "failed").length, allSettled: true, sources: coverage },
+    }, "completed");
+    logScan(scanId, "info", "lifecycle", "completed",
+      `微信监测完成：检查 ${examined} 篇，归档 ${fullTextSucceeded} 篇全文${config.outputMode === "projects" ? `，识别 ${projectMentions} 个项目` : ""}，API 花费 ¥${apiCostCny.toFixed(2)}`, {
+        examined, fullTextSucceeded, projectMentions, resultCount, apiCostCny, remainMoney, failures,
+      });
+    audit("scan", scanId, "completed", { acquisitionMode: "wechat", examined, fullTextSucceeded, resultCount, apiCostCny, failures });
+  } catch (error) {
+    let finalError: unknown = error;
+    try { await scanControlPoint(scanId); } catch (controlError) { finalError = controlError; }
+    const message = finalError instanceof Error ? finalError.message : String(finalError);
+    if (finalError instanceof ScanStoppedError) {
+      setProgress(scanId, { stoppedAt: now(), failures, dajialaApiCostCny: apiCostCny }, "stopped");
+      logScan(scanId, "warn", "lifecycle", "stopped", "微信监测已停止，已完成的全文和项目结果均已保留");
+      audit("scan", scanId, "stopped", { acquisitionMode: "wechat", fetched, apiCostCny });
+    } else {
+      setProgress(scanId, { failedAt: now(), failures: failures + 1, dajialaApiCostCny: apiCostCny }, "failed");
+      db.prepare("UPDATE scans SET status='failed', error=?, updated_at=? WHERE id=?").run(message, now(), scanId);
+      logScan(scanId, "error", "lifecycle", "failed", `微信监测失败：${message}`);
+      audit("scan", scanId, "failed", { acquisitionMode: "wechat", message, fetched, apiCostCny });
     }
   } finally {
     markScanActive(scanId, false);
@@ -1740,6 +2004,11 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (req.method === "POST" && sourceCheck) {
       const row = db.prepare("SELECT * FROM sources WHERE id=?").get(sourceCheck[1]) as Record<string, unknown> | undefined;
       if (!row) throw new Error("信息源不存在");
+      if (String(row.type) === "微信公众号") {
+        const sourceUrl = String(row.url);
+        const valid = /^wechat:\/\/ghid\/.+/i.test(sourceUrl) || /^https?:\/\/mp\.weixin\.qq\.com\//i.test(sourceUrl);
+        return sendJson(res, 200, { ok: valid, kind: "wechat-account", message: valid ? "公众号账号定位信息有效；运行任务时将通过大家啦历史接口验证" : "请填写公众号原始 ID（gh_ 开头）或该账号任意一篇文章链接" });
+      }
       const startedAt = Date.now();
       const doc = await fetchDocument(String(row.url), String(row.id), "source");
       return sendJson(res, 200, {
@@ -1810,6 +2079,12 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     const searchTest = url.pathname.match(/^\/api\/search-providers\/([^/]+)\/test$/);
     if (req.method === "POST" && searchTest) {
       const provider = getSearchProvider(searchTest[1]); if (!provider) throw new Error("搜索供应商不存在");
+      if (provider.kind === "dajiala") {
+        const result = await testDajialaConnection({
+          key: vault.get(`search:${provider.id}`), verifycode: vault.get(`search:${provider.id}:verifycode`),
+        }, { baseUrl: (provider.endpoint || DAJIALA_BASE_URL).replace(/\/$/, "") });
+        return sendJson(res, 200, result);
+      }
       const started = Date.now(); const results = await searchWeb(provider, String(body.query ?? "海外光伏储能项目"), 5);
       return sendJson(res, 200, { ok: true, latencyMs: Date.now() - started, results });
     }
@@ -1886,6 +2161,16 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (req.method === "POST" && scanApproveAll) return sendJson(res, 200, approveAllScanResults(scanApproveAll[1]));
     const scanArticles = url.pathname.match(/^\/api\/scans\/([^/]+)\/articles$/);
     if (req.method === "GET" && scanArticles) return sendJson(res, 200, getArticles(scanArticles[1]));
+    const documentFullText = url.pathname.match(/^\/api\/documents\/([^/]+)\/fulltext$/);
+    if (req.method === "GET" && documentFullText) {
+      const row = db.prepare("SELECT * FROM documents WHERE id=?").get(documentFullText[1]) as Record<string, unknown> | undefined;
+      if (!row) throw new Error("文章全文存档不存在");
+      const document = storedDocument(row);
+      return sendJson(res, 200, {
+        id: document.id, title: document.title, url: document.url, publishedAt: document.publishedAt,
+        sourceId: document.sourceId, text: document.text, warnings: document.warnings,
+      });
+    }
     const scanDiagnostics = url.pathname.match(/^\/api\/scans\/([^/]+)\/diagnostics$/);
     if (req.method === "GET" && scanDiagnostics) return sendJson(res, 200, getScanDiagnostics(scanDiagnostics[1]));
     const scanLogs = url.pathname.match(/^\/api\/scans\/([^/]+)\/logs$/);
@@ -1947,11 +2232,16 @@ function count(table: string, where?: string) {
 }
 
 function createSource(body: JsonObject) {
-  const id = randomUUID(); const url = normalizeUrl(String(body.url ?? ""));
-  if (!url) throw new Error("网址无效");
+  const id = randomUUID();
+  const type = String(body.type ?? "网址");
+  const rawUrl = String(body.url ?? "").trim();
+  const url = type === "微信公众号" ? rawUrl : normalizeUrl(rawUrl);
+  if (!url || type === "微信公众号" && !(/^wechat:\/\/ghid\/.+/i.test(url) || /^https?:\/\/mp\.weixin\.qq\.com\//i.test(url))) {
+    throw new Error(type === "微信公众号" ? "公众号定位信息无效" : "网址无效");
+  }
   // 必须具名列：位置式 INSERT 在表结构迁移（如补 updated_at 列）后会整体崩掉
   db.prepare("INSERT INTO sources (id,name,type,coverage,url,country,enabled,rate_limit_ms,created_at) VALUES (?,?,?,?,?,?,?,?,?)").run(
-    id, String(body.name ?? new URL(url).hostname), String(body.type ?? "网址"), String(body.coverage ?? ""),
+    id, String(body.name ?? new URL(url).hostname), type, String(body.coverage ?? ""),
     url, String(body.country ?? ""), body.enabled === false ? 0 : 1, Number(body.rateLimitMs ?? 1000), now(),
   );
   audit("source", id, "created", body);
@@ -1961,10 +2251,14 @@ function createSource(body: JsonObject) {
 function updateSource(id: string, body: JsonObject) {
   const existing = db.prepare("SELECT * FROM sources WHERE id=?").get(id) as Record<string, unknown> | undefined;
   if (!existing) throw new Error("信息源不存在或已删除");
-  const url = normalizeUrl(String(body.url ?? existing.url ?? ""));
-  if (!url) throw new Error("网址无效");
+  const type = String(body.type ?? existing.type);
+  const rawUrl = String(body.url ?? existing.url ?? "").trim();
+  const url = type === "微信公众号" ? rawUrl : normalizeUrl(rawUrl);
+  if (!url || type === "微信公众号" && !(/^wechat:\/\/ghid\/.+/i.test(url) || /^https?:\/\/mp\.weixin\.qq\.com\//i.test(url))) {
+    throw new Error(type === "微信公众号" ? "公众号定位信息无效" : "网址无效");
+  }
   db.prepare(`UPDATE sources SET name=?,type=?,coverage=?,url=?,country=?,enabled=?,rate_limit_ms=?,updated_at=? WHERE id=?`).run(
-    String(body.name ?? existing.name), String(body.type ?? existing.type), String(body.coverage ?? existing.coverage), url,
+    String(body.name ?? existing.name), type, String(body.coverage ?? existing.coverage), url,
     String(body.country ?? existing.country), body.enabled == null ? Number(existing.enabled) : body.enabled === false ? 0 : 1,
     Number(body.rateLimitMs ?? existing.rate_limit_ms ?? 1000), now(), id,
   );
@@ -2029,6 +2323,7 @@ function clearProviderSecret(id: string) {
 function saveSearchProvider(body: JsonObject) {
   const id = recordId(body); const updated = now();
   if (typeof body.apiKey === "string" && body.apiKey) vault.set(`search:${id}`, body.apiKey);
+  if (typeof body.verifycode === "string" && body.verifycode) vault.set(`search:${id}:verifycode`, body.verifycode);
   db.prepare(`INSERT INTO search_providers VALUES (?,?,?,?,?,?,?,?,?)
     ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,endpoint=excluded.endpoint,
     method=excluded.method,headers_json=excluded.headers_json,config_json=excluded.config_json,
@@ -2038,7 +2333,9 @@ function saveSearchProvider(body: JsonObject) {
       JSON.stringify(body.headers ?? {}), JSON.stringify(body.config ?? {}),
       body.enabled === false ? 0 : 1, updated,
     );
-  audit("search_provider", id, "saved", { ...body, apiKey: body.apiKey ? "***" : undefined });
+  audit("search_provider", id, "saved", {
+    ...body, apiKey: body.apiKey ? "***" : undefined, verifycode: body.verifycode ? "***" : undefined,
+  });
   return getSearchProvider(id);
 }
 
