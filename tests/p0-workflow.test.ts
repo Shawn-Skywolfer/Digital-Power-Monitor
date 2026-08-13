@@ -306,3 +306,23 @@ test("uses an opaque expiring grant for a writable export directory", async () =
   assert.notEqual(grant.token, directory);
   assert.equal(resolveExportDirectory(grant.token), path.resolve(directory));
 });
+
+test("writes every snapshot deliverable directly into the selected export directory", async () => {
+  const { db } = await import("../server/db");
+  const { exportSnapshot } = await import("../server/exporter");
+  const snapshotId = `snapshot-${Date.now()}`;
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), "dpm-direct-export-"));
+  db.prepare("INSERT INTO snapshots VALUES (?,?,?,?,?,?)").run(
+    snapshotId, "scan-direct-export", "[]", "[]", 0, new Date().toISOString(),
+  );
+
+  const exported = await exportSnapshot(snapshotId, target);
+  assert.equal(exported.delivery, "direct");
+  assert.equal(exported.outputDir, path.resolve(target));
+  assert.equal(Object.keys(exported.verification).length, 4);
+  for (const item of Object.values(exported.verification)) {
+    assert.equal(path.dirname(item.path), path.resolve(target));
+    assert.equal(item.exists, true);
+    assert.ok(item.size > 0);
+  }
+});

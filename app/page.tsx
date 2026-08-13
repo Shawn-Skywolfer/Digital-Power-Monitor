@@ -1232,22 +1232,22 @@ function ExportsView({ activeScan, results, fields, notify, onError }: { activeS
     if (choosingDirectory) return;
     setChoosingDirectory(true);
     try {
+      let nativeCause: unknown;
+      try {
+        const selected = await api<{ cancelled: boolean; token?: string; path?: string; name?: string }>("/api/export-directories/pick", { method: "POST", body: "{}" });
+        if (selected.cancelled) return;
+        if (!selected.token || !selected.path || !selected.name) throw new Error("服务端未返回有效的文件夹授权");
+        setTargetDirectory({ mode: "native", token: selected.token, path: selected.path, name: selected.name });
+        return;
+      } catch (cause) {
+        nativeCause = cause;
+      }
       const browserWindow = window as unknown as { showDirectoryPicker?: (options?: { mode: "readwrite" }) => Promise<LocalDirectoryHandle> };
       const picker = browserWindow.showDirectoryPicker?.bind(window);
-      if (picker) {
-        try {
-          const handle = await picker({ mode: "readwrite" });
-          if (handle.requestPermission && await handle.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("没有获得目标文件夹的写入权限");
-          setTargetDirectory({ mode: "browser", handle, path: handle.name, name: handle.name });
-          return;
-        } catch (browserCause) {
-          if (browserCause instanceof DOMException && browserCause.name === "AbortError") return;
-        }
-      }
-      const selected = await api<{ cancelled: boolean; token?: string; path?: string; name?: string }>("/api/export-directories/pick", { method: "POST", body: "{}" });
-      if (selected.cancelled) return;
-      if (!selected.token || !selected.path || !selected.name) throw new Error("服务端未返回有效的文件夹授权");
-      setTargetDirectory({ mode: "native", token: selected.token, path: selected.path, name: selected.name });
+      if (!picker) throw nativeCause;
+      const handle = await picker({ mode: "readwrite" });
+      if (handle.requestPermission && await handle.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("没有获得目标文件夹的写入权限");
+      setTargetDirectory({ mode: "browser", handle, path: handle.name, name: handle.name });
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === "AbortError") return;
       onError(cause instanceof Error ? cause.message : String(cause));
@@ -1284,10 +1284,15 @@ function ExportsView({ activeScan, results, fields, notify, onError }: { activeS
         setExported({ location: output.outputDir, files, verified: true });
         notify(`四个文件已直接写入并校验：${output.outputDir}`);
       } else if (targetDirectory?.mode === "browser") {
-        const files = await copyToTarget(output.downloads);
-        await api(`/api/exports/${output.id}/staging`, { method: "DELETE" });
-        setExported({ location: `所选文件夹：${targetDirectory.path}`, files, verified: true });
-        notify(`已校验 ${files.length} 个文件，并保存到“${targetDirectory.name}”`);
+        try {
+          const files = await copyToTarget(output.downloads);
+          await api(`/api/exports/${output.id}/staging`, { method: "DELETE" });
+          setExported({ location: `所选文件夹：${targetDirectory.path}`, files, verified: true });
+          notify(`已校验 ${files.length} 个文件，并保存到“${targetDirectory.name}”`);
+        } catch (cause) {
+          setExported({ location: `浏览器写入失败；文件已保留在：${output.outputDir}`, files: Object.values(output.files), verified: false });
+          throw new Error(`无法写入所选文件夹：${cause instanceof Error ? cause.message : String(cause)}。文件已保留在应用默认目录，重新选择文件夹后可再次导出。`);
+        }
       } else {
         setExported({ location: output.outputDir, files: Object.values(output.files), verified: true });
         notify("四种交付文件已生成到应用默认目录");
@@ -1311,7 +1316,7 @@ function ExportsView({ activeScan, results, fields, notify, onError }: { activeS
           <Deliverable icon="J" title="JSON 数据" note="完整字段、证据、评分和审核历史" />
           <Deliverable icon="Z" title="网页全文证据包" note="原始 HTML/PDF、清洗正文与哈希" />
         </div>
-        {exported && <div className="export-result"><strong>{exported.verified ? "导出完成并校验通过" : "导出完成"}</strong><p>{exported.location}</p>{exported.files.map((value) => <div key={value}><span>文件</span><code>{value}</code></div>)}</div>}
+        {exported && <div className={exported.verified ? "export-result" : "export-result failed"}><strong>{exported.verified ? "导出完成并校验通过" : "未写入所选目标文件夹"}</strong><p>{exported.location}</p>{exported.files.map((value) => <div key={value}><span>文件</span><code>{value}</code></div>)}</div>}
       </section>
     </div>
   );
