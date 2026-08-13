@@ -43,13 +43,19 @@ export async function exportSnapshot(snapshotId: string, targetDirectory?: strin
     return legacy ? mapResult(legacy) : undefined;
   }).filter(Boolean) as ResultRecord[];
   const scanId = String(snapshot.scan_id);
-  const scan = db.prepare("SELECT progress_json FROM scans WHERE id=?").get(scanId) as { progress_json?: string } | undefined;
+  const scan = db.prepare("SELECT progress_json,request_json FROM scans WHERE id=?").get(scanId) as { progress_json?: string; request_json?: string } | undefined;
   const coverage = jsonParse<Record<string, unknown>>(scan?.progress_json, {});
+  const request = jsonParse<Record<string, unknown>>(scan?.request_json, {});
   const stamp = now().replace(/[:.]/g, "-");
   const outputDir = targetDirectory
     ? path.resolve(targetDirectory)
     : path.resolve("outputs", `monitor-${safeName(scanId)}-${stamp}`);
   fs.mkdirSync(outputDir, { recursive: true });
+
+  const wechat = request.wechat && typeof request.wechat === "object" ? request.wechat as Record<string, unknown> : undefined;
+  if (request.acquisitionMode === "wechat" && wechat?.outputMode === "fulltext") {
+    return exportWechatFullText(snapshotId, scanId, outputDir, targetDirectory);
+  }
 
   const base = `海外能源项目监测_${scanId.slice(0, 8)}${targetDirectory ? `_${stamp}` : ""}`;
   const xlsxPath = path.join(outputDir, `${base}.xlsx`);
@@ -75,6 +81,52 @@ export async function exportSnapshot(snapshotId: string, targetDirectory?: strin
   const verification = Object.fromEntries(Object.entries(files).map(([key, filePath]) => [key, {
     path: filePath, exists: fs.existsSync(filePath), size: fs.statSync(filePath).size,
   }]));
+  return { id: exportId, outputDir, files, downloads, verification, delivery: targetDirectory ? "direct" : "staging" };
+}
+
+type WechatFullTextRow = { account: string; publishedAt: string; title: string; body: string; url: string; documentId: string };
+
+async function exportWechatFullText(snapshotId: string, scanId: string, outputDir: string, targetDirectory?: string) {
+  const rows = (db.prepare(`SELECT d.id,d.url,d.title,d.published_at,d.text,d.markdown,s.name AS source_name
+    FROM documents d LEFT JOIN sources s ON s.id=d.source_id WHERE d.scan_id=?
+    ORDER BY d.published_at DESC,d.title`).all(scanId) as Record<string, unknown>[]).map<WechatFullTextRow>((row) => {
+      const markdown = String(row.markdown ?? "");
+      const text = String(row.text ?? "");
+      const marker = /(?:^|\n)正文：\s*\n/;
+      const body = marker.test(markdown) ? markdown.split(marker).slice(1).join("\n正文：\n").trim() : text.replace(/^微信公众号：[^\n]*\n(?:[^\n：]+：[^\n]*\n)*\s*正文：\s*/u, "").trim();
+      return { account: String(row.source_name ?? ""), publishedAt: String(row.published_at ?? ""), title: String(row.title ?? ""), body, url: String(row.url ?? ""), documentId: String(row.id) };
+    });
+  const stamp = now().replace(/[:.]/g, "-");
+  const base = `微信公众号全文_${scanId.slice(0, 8)}${targetDirectory ? `_${stamp}` : ""}`;
+  const xlsxPath = path.join(outputDir, `${base}.xlsx`);
+  const mdPath = path.join(outputDir, `${base}.md`);
+  const jsonPath = path.join(outputDir, `${base}.json`);
+  const zipPath = path.join(outputDir, `${base}_正文包.zip`);
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet("微信全文", { views: [{ state: "frozen", ySplit: 1 }] });
+  sheet.columns = [
+    { header: "公众号账号", key: "account", width: 24 }, { header: "发布日期", key: "publishedAt", width: 14 },
+    { header: "文章标题", key: "title", width: 48 }, { header: "正文", key: "body", width: 100 },
+  ];
+  rows.forEach((row) => sheet.addRow({ account: row.account, publishedAt: row.publishedAt, title: row.title, body: row.body }));
+  sheet.getRow(1).eachCell((cell) => { cell.font = { bold: true, color: { argb: "FFFFFFFF" } }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF173D3A" } }; });
+  sheet.eachRow((row, index) => { if (index > 1) row.alignment = { vertical: "top", wrapText: true }; });
+  sheet.autoFilter = { from: "A1", to: `D${Math.max(1, rows.length + 1)}` };
+  await workbook.xlsx.writeFile(xlsxPath);
+  const publicRows = rows.map(({ account, publishedAt, title, body }) => ({ "公众号账号": account, "发布日期": publishedAt, "文章标题": title, "正文": body }));
+  fs.writeFileSync(jsonPath, JSON.stringify(publicRows, null, 2), "utf8");
+  fs.writeFileSync(mdPath, ["# 微信公众号全文归档", "", ...publicRows.flatMap((row) => [`## ${row.文章标题}`, "", `- 公众号账号：${row.公众号账号}`, `- 发布日期：${row.发布日期}`, "", row.正文, ""])].join("\n"), "utf8");
+  await new Promise<void>((resolve, reject) => {
+    const output = fs.createWriteStream(zipPath); const archive = archiver("zip", { zlib: { level: 9 } });
+    output.on("close", resolve); archive.on("error", reject); archive.pipe(output);
+    rows.forEach((row, index) => archive.append(row.body, { name: `${String(index + 1).padStart(4, "0")}_${safeName(row.account)}_${safeName(row.title)}.txt` }));
+    archive.append(JSON.stringify(publicRows, null, 2), { name: "manifest.json" }); void archive.finalize();
+  });
+  const files = { xlsx: xlsxPath, markdown: mdPath, json: jsonPath, evidenceZip: zipPath };
+  const exportId = randomUUID();
+  db.prepare("INSERT INTO exports VALUES (?,?,?,?,?)").run(exportId, snapshotId, outputDir, JSON.stringify(files), now());
+  const downloads = Object.fromEntries(Object.entries(files).map(([key, filePath]) => [key, { name: path.basename(filePath), url: `/api/exports/${exportId}/files/${key}` }]));
+  const verification = Object.fromEntries(Object.entries(files).map(([key, filePath]) => [key, { path: filePath, exists: fs.existsSync(filePath), size: fs.statSync(filePath).size }]));
   return { id: exportId, outputDir, files, downloads, verification, delivery: targetDirectory ? "direct" : "staging" };
 }
 

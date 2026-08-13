@@ -12,7 +12,7 @@ type Provider = {
   id: string; name: string; kind: string; baseUrl: string; enabled: boolean; hasSecret: boolean;
   headers?: Record<string, string>; config?: Json;
 };
-type SearchProvider = { id: string; name: string; kind: string; endpoint: string; enabled: boolean; hasSecret: boolean };
+type SearchProvider = { id: string; name: string; kind: string; endpoint: string; enabled: boolean; hasSecret: boolean; hasVerifycode?: boolean };
 type McpServer = {
   id: string; name: string; transport: string; url: string; command: string; enabled: boolean;
   args?: string[]; envKeys?: string[];
@@ -26,9 +26,10 @@ type BrowserRendering = {
   hasToken: boolean; source: "db" | "env" | "none"; envEndpoint: boolean;
 };
 type BrowserProbe = { ok: boolean; latencyMs: number; endpoint?: string; version?: string; error?: string; diagnosis?: string };
+type ConnectionTestState = { status: "running" | "success" | "failed"; startedAt: number; finishedAt?: number; result?: Json; error?: string };
 type Scan = { id: string; status: string; progress: Record<string, unknown>; createdAt: string; request?: Json; error?: string };
 type Result = {
-  id: string; fields: Record<string, unknown>; primaryUrl: string; candidateUrls: string[];
+  id: string; documentId?: string; fields: Record<string, unknown>; primaryUrl: string; candidateUrls: string[];
   evidence: Record<string, string>; conflicts: string[]; score: number; status: string; revision: number; generatedFields?: string[];
   originalFields?: Record<string, string>; evidenceTranslations?: Record<string, string>; sourceLanguage?: string;
   unitChecks?: Record<string, string>;
@@ -337,7 +338,7 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
   onCreated: (scan: Scan) => void; onError: (message: string) => void;
 }) {
   const [step, setStep] = useState(1);
-  const [acquisitionMode, setAcquisitionMode] = useState<"web" | "project-intel">("web");
+  const [acquisitionMode, setAcquisitionMode] = useState<"web" | "project-intel" | "wechat">("web");
   const [periodMode, setPeriodMode] = useState<"month" | "custom">("month");
   const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
   const [fieldIds, setFieldIds] = useState<string[]>(fields.map((field) => field.id));
@@ -355,6 +356,13 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
   const [referenceRows, setReferenceRows] = useState<Record<string, unknown>[]>([]);
   const [referenceName, setReferenceName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [wechatProviderId, setWechatProviderId] = useState("");
+  const [wechatOutputMode, setWechatOutputMode] = useState<"fulltext" | "projects">("fulltext");
+  const [wechatMaxApiCostCny, setWechatMaxApiCostCny] = useState(10);
+  const wechatProviders = searchProviders.filter((provider) => provider.kind === "dajiala");
+  const webSearchProviders = searchProviders.filter((provider) => provider.kind !== "dajiala");
+  const websiteSources = sources.filter((source) => source.type !== "微信公众号");
+  const wechatSources = sources.filter((source) => source.type === "微信公众号" && source.enabled);
 
   function applyMonth(month: string) {
     if (!/^\d{4}-\d{2}$/.test(month)) return;
@@ -365,23 +373,30 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
     setEndDate(`${month}-${String(lastDay).padStart(2, "0")}`);
   }
 
-  function chooseAcquisitionMode(mode: "web" | "project-intel") {
+  function chooseAcquisitionMode(mode: "web" | "project-intel" | "wechat") {
     setAcquisitionMode(mode);
     setStep(1);
     if (mode === "project-intel") {
       setPeriodMode("month");
       applyMonth(selectedMonth);
       setBudget((current) => ({ ...current, maxPages: Math.max(500, current.maxPages) }));
+    } else if (mode === "wechat") {
+      setBudget((current) => ({ ...current, maxPages: Math.min(200, Math.max(20, current.maxPages)), maxConcurrency: 1 }));
+      setSourceIds(wechatSources.map((source) => source.id));
+      if (!wechatProviderId && wechatProviders[0]?.id) setWechatProviderId(wechatProviders[0].id);
+    } else {
+      setSourceIds(websiteSources.filter((source) => source.enabled).map((source) => source.id));
     }
   }
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setFieldIds((current) => current.length ? current : fields.map((field) => field.id));
-      setSourceIds((current) => current.length ? current : sources.filter((source) => source.enabled).map((source) => source.id));
+      setSourceIds((current) => current.length ? current : sources.filter((source) => acquisitionMode === "wechat" ? source.type === "微信公众号" && source.enabled : source.type !== "微信公众号" && source.enabled).map((source) => source.id));
+      setWechatProviderId((current) => current || searchProviders.find((provider) => provider.kind === "dajiala")?.id || "");
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [fields, sources]);
+  }, [acquisitionMode, fields, sources, searchProviders]);
 
   async function chooseProvider(id: string) {
     setProviderId(id); setModelId(""); setModelOptions([]);
@@ -408,11 +423,19 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
       onError(`已选择 ${sourceIds.length} 个来源，最大抓取页数至少应为 ${sourceIds.length}，才能为每个来源保留 1 页额度。`);
       return;
     }
+    if (acquisitionMode === "wechat" && (!wechatProviderId || !sourceIds.length || (wechatOutputMode === "projects" && (!providerId || !modelId)))) {
+      setStep(!sourceIds.length ? 3 : 4);
+      onError(!sourceIds.length ? "请先导入并选择至少一个微信公众号账号。" : "项目字段分析模式需要配置大家啦 API，并选择大模型供应商与模型。");
+      return;
+    }
     setBusy(true);
     try {
+      const wechat = acquisitionMode === "wechat" ? {
+        outputMode: wechatOutputMode, maxApiCostCny: wechatMaxApiCostCny,
+      } : undefined;
       const scan = await api<Scan>("/api/scans", {
         method: "POST",
-        body: JSON.stringify({ acquisitionMode, startDate, endDate, fieldIds, sourceIds: acquisitionMode === "web" ? sourceIds : [], providerId, modelId, searchProviderIds: searchIds, mcpServerIds: mcpIds, budget, ignoreRobots, overseasOnly, referenceRows: acquisitionMode === "web" ? referenceRows : undefined }),
+        body: JSON.stringify({ acquisitionMode, startDate, endDate, fieldIds, sourceIds: acquisitionMode === "project-intel" ? [] : sourceIds, providerId: wechatOutputMode === "fulltext" && acquisitionMode === "wechat" ? undefined : providerId, modelId: wechatOutputMode === "fulltext" && acquisitionMode === "wechat" ? undefined : modelId, searchProviderIds: searchIds, mcpServerIds: mcpIds, budget, ignoreRobots, overseasOnly, referenceRows: acquisitionMode === "web" ? referenceRows : undefined, wechatProviderId, wechat }),
       });
       onCreated(scan);
     } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
@@ -425,6 +448,10 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
     acquisitionMode === "web" && budget.maxPages < sourceIds.length ? `总页数 ${budget.maxPages} 小于来源数 ${sourceIds.length}，无法保证每站至少检查 1 页。` : "",
     rangeDays === 1 ? "当前只检索单日发布内容；多数官网并非每天发布项目消息，结果很容易为 0。" : "",
     acquisitionMode === "web" && sourceIds.length >= 20 && !searchIds.length && !mcpIds.length ? "来源较多且未启用搜索 API/MCP；官网连接失败时没有外部检索回退。" : "",
+    acquisitionMode === "wechat" && !wechatProviderId ? "尚未配置大家啦微信 API；请先到“搜索 API”页面保存 API Key。" : "",
+    acquisitionMode === "wechat" && !wechatSources.length ? "公众号账号库为空；请先到“监测来源”导入账号。" : "",
+    acquisitionMode === "wechat" && !sourceIds.length ? "尚未选择要监测的公众号账号。" : "",
+    acquisitionMode === "wechat" && wechatOutputMode === "projects" && (!providerId || !modelId) ? "项目字段分析模式尚未选择大模型。" : "",
   ].filter(Boolean);
   return (
     <div className="wizard-layout">
@@ -443,6 +470,9 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
           <button type="button" role="tab" aria-selected={acquisitionMode === "project-intel"} className={acquisitionMode === "project-intel" ? "active" : ""} onClick={() => chooseAcquisitionMode("project-intel")}>
             <span>▦</span><div><strong>Project Intel 批量采集</strong><small>按发布时间范围导入结构化项目</small></div>
           </button>
+          <button type="button" role="tab" aria-selected={acquisitionMode === "wechat"} className={acquisitionMode === "wechat" ? "active" : ""} onClick={() => chooseAcquisitionMode("wechat")}>
+            <span>微</span><div><strong>微信公众号监测</strong><small>按已导入账号和日期归档全文或分析项目</small></div>
+          </button>
         </div>
         <div className="wizard-head">
           <div><p className="eyebrow">步骤 {step} / 5</p><h2>{steps[step - 1]}</h2></div>
@@ -450,16 +480,14 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
         </div>
         {step === 1 && (
           <div>
-            <div className="section-intro"><p>勾选本次需要提取并导出的字段。项目名称、国家、发布日期和证据元数据仍会在后台用于去重。</p><button className="ghost small" onClick={() => setFieldIds(fieldIds.length === fields.length ? [] : fields.map((field) => field.id))}>{fieldIds.length === fields.length ? "取消全选" : "全选"}</button></div>
-            <div className="field-grid">
-              {fields.map((field) => <CheckCard key={field.id} checked={fieldIds.includes(field.id)} title={field.label.replace("\n", " ")} meta={`${field.type}${field.unit ? ` · ${field.unit}` : ""}`} onChange={() => setFieldIds(toggle(fieldIds, field.id))} />)}
-            </div>
+            {acquisitionMode === "wechat" && <><div className="section-intro"><p>先选择结果形态。两种模式都会从已导入的公众号账号抓取所选时间段文章并取得完整正文。</p></div><div className="period-mode" role="tablist" aria-label="微信监测结果模式"><button type="button" className={wechatOutputMode === "fulltext" ? "active" : ""} onClick={() => setWechatOutputMode("fulltext")}>全文归档导出</button><button type="button" className={wechatOutputMode === "projects" ? "active" : ""} onClick={() => setWechatOutputMode("projects")}>按项目字段分析</button></div><div className="info-card"><span>{wechatOutputMode === "fulltext" ? "文" : "AI"}</span><div><strong>{wechatOutputMode === "fulltext" ? "原文资料库" : "项目结构化结果"}</strong><p>{wechatOutputMode === "fulltext" ? "导出只包含公众号账号、发布日期、文章标题、正文，不调用大模型，也不进行项目判断。" : "大模型阅读文章全文，判断并拆分项目，按下面选定的现有字段输出原文证据。"}</p></div></div></>}
+            {(acquisitionMode !== "wechat" || wechatOutputMode === "projects") && <><div className="section-intro"><p>勾选本次需要提取并导出的字段。项目名称、国家、发布日期和证据元数据仍会在后台用于去重。</p><button className="ghost small" onClick={() => setFieldIds(fieldIds.length === fields.length ? [] : fields.map((field) => field.id))}>{fieldIds.length === fields.length ? "取消全选" : "全选"}</button></div><div className="field-grid">{fields.map((field) => <CheckCard key={field.id} checked={fieldIds.includes(field.id)} title={field.label.replace("\n", " ")} meta={`${field.type}${field.unit ? ` · ${field.unit}` : ""}`} onChange={() => setFieldIds(toggle(fieldIds, field.id))} />)}</div></>}
             {acquisitionMode === "web" && <label className="upload-box compact"><input type="file" accept=".xlsx" onChange={(event) => void loadReference(event.target.files?.[0])} /><span>⇧</span><div><strong>上传项目参考表（可选）</strong><p>{referenceName ? `${referenceName} · ${referenceRows.length} 条记录` : "用于给已有项目逐条寻找原始页面"}</p></div></label>}
           </div>
         )}
         {step === 2 && (
           <div className="form-section">
-            <p className="section-copy">{acquisitionMode === "project-intel" ? "按 Project Intel 的收录发布时间（recorded_at）筛选，开始与结束日期均包含。可以直接选择整月，也可以自定义日期。" : "系统按网页发布日期筛选，开始与结束日期均包含。没有可识别发布日期的页面会保留并进入人工审核。"}</p>
+            <p className="section-copy">{acquisitionMode === "project-intel" ? "按 Project Intel 的收录发布时间（recorded_at）筛选，开始与结束日期均包含。可以直接选择整月，也可以自定义日期。" : acquisitionMode === "wechat" ? "按所选公众号账号的文章发布时间精确筛选，开始与结束日期均包含；当历史分页早于开始日期后自动停止。" : "系统按网页发布日期筛选，开始与结束日期均包含。没有可识别发布日期的页面会保留并进入人工审核。"}</p>
             {acquisitionMode === "project-intel" && <div className="period-mode">
               <button type="button" className={periodMode === "month" ? "active" : ""} onClick={() => { setPeriodMode("month"); applyMonth(selectedMonth); }}>按月</button>
               <button type="button" className={periodMode === "custom" ? "active" : ""} onClick={() => setPeriodMode("custom")}>自定义日期</button>
@@ -470,18 +498,24 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
               <i>→</i>
               <label><span>结束日期</span><input type="date" value={endDate} disabled={acquisitionMode === "project-intel" && periodMode === "month"} onChange={(e) => setEndDate(e.target.value)} /></label>
             </div>
-            <div className="info-card"><span>i</span><div><strong>日期口径</strong><p>{acquisitionMode === "project-intel" ? "这里指项目进入 Project Intel 数据库的时间，不是项目开工、签约或投产日期。" : "这里指信息来源网页的公开发布日期，而不是项目开工、签约或投产日期。"}</p></div></div>
+            <div className="info-card"><span>i</span><div><strong>日期口径</strong><p>{acquisitionMode === "project-intel" ? "这里指项目进入 Project Intel 数据库的时间，不是项目开工、签约或投产日期。" : acquisitionMode === "wechat" ? "这里指公众号文章的发文日期，不是文章正文中项目开工、签约或投产日期。链接导入时日期不明的文章会保留并进入人工审核。" : "这里指信息来源网页的公开发布日期，而不是项目开工、签约或投产日期。"}</p></div></div>
           </div>
         )}
         {step === 3 && (
           acquisitionMode === "project-intel" ? <div className="project-intel-source">
             <div className="project-intel-source-head"><span>▦</span><div><strong>Project Intel · 风光氢储出海数据库</strong><p>energy-overseas.com/project-intel</p></div><em>已固定选择</em></div>
             <div className="project-intel-policy"><strong>温和采集策略</strong><p>只读取公开的结构化列表接口；沿用站点前端每页 20 条的分页、请求串行、分页间隔至少 3 秒；不逐条打开详情页，遇到限流自动退避。</p></div>
+          </div> : acquisitionMode === "wechat" ? <div className="form-section">
+            <div className="project-intel-source-head"><span>微</span><div><strong>公众号账号库</strong><p>只监测你在“监测来源”中已导入并启用的账号</p></div><em>{sourceIds.length} / {wechatSources.length} 个</em></div>
+            <label><span>微信 API 配置</span><select value={wechatProviderId} onChange={(event) => setWechatProviderId(event.target.value)}><option value="">请选择大家啦 API</option>{wechatProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name} · {provider.hasSecret ? "密钥已保存" : "缺少密钥"}</option>)}</select></label>
+            {wechatProviders.length === 0 && <div className="preflight-warning"><strong>尚未配置微信 API</strong><p>请先到左侧“搜索 API”，新增“大家啦微信内容”并保存 API Key；附加码如账号已启用则一并填写。</p></div>}
+            <div className="section-intro"><p>选择本次要监测的公众号账号。</p><button className="ghost small" onClick={() => setSourceIds(wechatSources.length > 0 && sourceIds.length === wechatSources.length ? [] : wechatSources.map((source) => source.id))}>{wechatSources.length > 0 && sourceIds.length === wechatSources.length ? "取消全选" : "全选"}</button></div>
+            <div className="source-picker">{wechatSources.length === 0 && <Empty text="公众号账号库为空。请先到“监测来源”切换到“微信公众号”，导入账号。" />}{wechatSources.map((source) => <label key={source.id} className={sourceIds.includes(source.id) ? "source-row selected" : "source-row"}><input type="checkbox" checked={sourceIds.includes(source.id)} onChange={() => setSourceIds(toggle(sourceIds, source.id))} /><span className="source-logo">微</span><div><strong>{source.name}</strong><p>{source.coverage || "公众号历史文章"}</p></div><em>微信公众号</em></label>)}</div>
           </div> : <div>
-            <div className="section-intro"><p>已选择 {sourceIds.length} / {sources.length} 个来源。系统会优先扫描站点栏目、RSS 和站点地图。</p><button className="ghost small" onClick={() => setSourceIds(sourceIds.length === sources.length ? [] : sources.map((source) => source.id))}>切换全选</button></div>
+            <div className="section-intro"><p>已选择 {sourceIds.length} / {websiteSources.length} 个来源。系统会优先扫描站点栏目、RSS 和站点地图。</p><button className="ghost small" onClick={() => setSourceIds(sourceIds.length === websiteSources.length ? [] : websiteSources.map((source) => source.id))}>切换全选</button></div>
             <div className="source-picker">
-              {sources.length === 0 && <Empty text="请先到“监测来源”导入信息来源.xlsx 或手工添加站点。" />}
-              {sources.map((source) => (
+              {websiteSources.length === 0 && <Empty text="请先到“监测来源”导入信息来源.xlsx 或手工添加站点。" />}
+              {websiteSources.map((source) => (
                 <label key={source.id} className={sourceIds.includes(source.id) ? "source-row selected" : "source-row"}>
                   <input type="checkbox" checked={sourceIds.includes(source.id)} onChange={() => setSourceIds(toggle(sourceIds, source.id))} />
                   <span className="source-logo">{source.name.slice(0, 1)}</span>
@@ -495,13 +529,22 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
           acquisitionMode === "project-intel" ? <div className="form-section">
             <div className="info-card project-intel-capability"><span>✓</span><div><strong>无需额外模型或搜索服务</strong><p>项目列表已经提供名称、国家、规模、开发商、EPC、阶段、正文和收录时间。本模式直接映射结构化字段，可减少外部请求和模型费用。</p></div></div>
             <div className="project-intel-policy"><strong>结果复核</strong><p>Project Intel 属于二手聚合信息，导入结果会自动进入人工复核，并保留原项目链接与完整字段证据。</p></div>
+          </div> : acquisitionMode === "wechat" ? <div className="form-section">
+            {wechatOutputMode === "fulltext" ? <div className="info-card project-intel-capability"><span>文</span><div><strong>全文归档无需大模型</strong><p>系统取得文章完整正文后直接归档；导出固定为账号、日期、标题、正文四列，不产生项目结果和模型费用。</p></div></div> : <>
+            <div className="form-grid">
+              <label><span>全文理解模型供应商（必选）</span><select value={providerId} onChange={(e) => void chooseProvider(e.target.value)}><option value="">选择模型供应商</option>{providers.filter((provider) => provider.enabled).map((provider) => <option key={provider.id} value={provider.id}>{provider.name} · {provider.hasSecret ? "密钥已保存" : "缺少密钥"}</option>)}</select></label>
+              <label><span>模型（必选）</span><select value={modelId} onChange={(e) => setModelId(e.target.value)} disabled={!providerId}><option value="">选择模型</option>{modelOptions.map((model) => <option key={model.id} value={model.id}>{model.name || model.id}</option>)}</select></label>
+            </div>
+            <div className="info-card project-intel-capability"><span>AI</span><div><strong>全文理解与现有字段抽取</strong><p>模型会判断文章是否包含真实海外新能源项目；一篇文章可拆分为多个项目，并按现有字段逐项提取原文证据。超长文章会自动分段理解后合并去重。</p></div></div>
+            <div className="project-intel-policy"><strong>可审计结果</strong><p>系统会保存文章标题、公众号、发布日期、原始链接与全文，并将每个输出字段绑定到原文证据；无关文章保留分类日志但不会形成项目结果。</p></div>
+            </>}
           </div> : <div className="form-section">
             <div className="form-grid">
               <label><span>抽取模型供应商</span><select value={providerId} onChange={(e) => void chooseProvider(e.target.value)}><option value="">仅规则抽取</option>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></label>
               <label><span>模型</span><select value={modelId} onChange={(e) => setModelId(e.target.value)} disabled={!providerId}><option value="">选择模型</option>{modelOptions.map((model) => <option key={model.id} value={model.id}>{model.name || model.id}</option>)}</select></label>
             </div>
             <h3 className="form-subtitle">搜索 API</h3>
-            <div className="check-list">{searchProviders.map((item) => <CheckLine key={item.id} checked={searchIds.includes(item.id)} label={item.name} meta={`${item.kind} · ${item.hasSecret ? "密钥已保存" : "未设置密钥"}`} onChange={() => setSearchIds(toggle(searchIds, item.id))} />)}{searchProviders.length === 0 && <Empty text="未配置搜索 API；仍可扫描已选网站。" />}</div>
+            <div className="check-list">{webSearchProviders.map((item) => <CheckLine key={item.id} checked={searchIds.includes(item.id)} label={item.name} meta={`${item.kind} · ${item.hasSecret ? "密钥已保存" : "未设置密钥"}`} onChange={() => setSearchIds(toggle(searchIds, item.id))} />)}{webSearchProviders.length === 0 && <Empty text="未配置通用搜索 API；仍可扫描已选网站。" />}</div>
             <h3 className="form-subtitle">MCP 服务器</h3>
             <div className="info-card"><span>⇉</span><div><strong>并行执行</strong><p>可以同时勾选多个 MCP。任务启动后会并行连接各服务器，并自动调用其 crawl、scrape、search、map 等适用工具；单个 MCP 失败不会阻断其他服务器。</p></div></div>
             <div className="check-list">{mcpServers.map((item) => <CheckLine key={item.id} checked={mcpIds.includes(item.id)} label={item.name} meta={`${item.transport} · 并行调用`} onChange={() => setMcpIds(toggle(mcpIds, item.id))} />)}{mcpServers.length === 0 && <Empty text="未连接外部 MCP；本应用自身的 MCP 服务仍然可用。" />}</div>
@@ -510,10 +553,12 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
         {step === 5 && (
           <div className="form-section">
             <div className="budget-grid">
-              <BudgetInput label={acquisitionMode === "project-intel" ? "最大导入项目数" : "最大抓取页数"} value={budget.maxPages} onChange={(value) => setBudget({ ...budget, maxPages: value })} />
+              <BudgetInput label={acquisitionMode === "project-intel" ? "最大导入项目数" : acquisitionMode === "wechat" ? "最大处理文章数" : "最大抓取页数"} value={budget.maxPages} onChange={(value) => setBudget({ ...budget, maxPages: value })} />
               {acquisitionMode === "web" && <><BudgetInput label="最大搜索次数" value={budget.maxSearches} min={0} onChange={(value) => setBudget({ ...budget, maxSearches: value })} /><BudgetInput label="运行时长参考（分钟，不截断）" value={budget.maxMinutes} onChange={(value) => setBudget({ ...budget, maxMinutes: value })} /><BudgetInput label="并发数" value={budget.maxConcurrency} onChange={(value) => setBudget({ ...budget, maxConcurrency: value })} /><BudgetInput label="模型费用上限（USD）" value={budget.maxCostUsd} min={0} step={0.5} onChange={(value) => setBudget({ ...budget, maxCostUsd: value })} /></>}
+              {acquisitionMode === "wechat" && <><BudgetInput label="大家啦 API 费用上限（CNY）" value={wechatMaxApiCostCny} min={0.16} step={0.1} onChange={setWechatMaxApiCostCny} />{wechatOutputMode === "projects" && <BudgetInput label="模型费用上限（USD）" value={budget.maxCostUsd} min={0} step={0.5} onChange={(value) => setBudget({ ...budget, maxCostUsd: value })} />}</>}
             </div>
             {acquisitionMode === "project-intel" && <div className="project-intel-policy"><strong>访问频率已固定为保守模式</strong><p>并发 1 · 每页 20 条 · 分页间隔至少 3 秒 · 限流后等待重试。为了保护目标站点，此处不开放提高并发或缩短间隔。</p></div>}
+            {acquisitionMode === "wechat" && <div className="project-intel-policy"><strong>费用和调用保护</strong><p>每个账号先分页读取历史发布记录，再对时间范围内文章调用详情接口取得正文（约 ¥0.03/篇）。任务串行、遇到临时错误有限退避，并在费用上限前停止新增请求。</p></div>}
             {acquisitionMode === "web" && <CheckLine
               checked={ignoreRobots}
               label="模拟真人浏览器访问，忽略 robots.txt 抓取限制"
@@ -529,10 +574,10 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
             {preflightWarnings.length > 0 && <div className="preflight-warning"><strong>启动前请检查</strong>{preflightWarnings.map((warning) => <p key={warning}>• {warning}</p>)}</div>}
             <div className="summary-card">
               <h3>本次监测摘要</h3>
-              <div><span>字段</span><strong>{fieldIds.length} 项</strong></div>
+              <div><span>输出</span><strong>{acquisitionMode === "wechat" && wechatOutputMode === "fulltext" ? "账号、日期、标题、正文" : `${fieldIds.length} 个项目字段`}</strong></div>
               <div><span>时间</span><strong>{startDate} 至 {endDate}</strong></div>
-              <div><span>来源</span><strong>{acquisitionMode === "project-intel" ? "Project Intel" : `${sourceIds.length} 个`}</strong></div>
-              {acquisitionMode === "project-intel" ? <div><span>访问策略</span><strong>串行低频 · 列表接口</strong></div> : <><div><span>参考项目</span><strong>{referenceRows.length || "无"}</strong></div><div><span>模型</span><strong>{modelId || "仅规则抽取"}</strong></div><div><span>外部搜索</span><strong>{searchIds.length} 个</strong></div><div><span>并行 MCP</span><strong>{mcpIds.length} 个</strong></div></>}
+              <div><span>来源</span><strong>{acquisitionMode === "project-intel" ? "Project Intel" : acquisitionMode === "wechat" ? "微信公众号" : `${sourceIds.length} 个`}</strong></div>
+              {acquisitionMode === "project-intel" ? <div><span>访问策略</span><strong>串行低频 · 列表接口</strong></div> : acquisitionMode === "wechat" ? <><div><span>账号</span><strong>{sourceIds.length} 个已导入公众号</strong></div><div><span>结果模式</span><strong>{wechatOutputMode === "fulltext" ? "全文归档导出" : "按项目字段分析"}</strong></div>{wechatOutputMode === "projects" && <div><span>模型</span><strong>{modelId || "未选择"}</strong></div>}<div><span>API 上限</span><strong>¥{wechatMaxApiCostCny.toFixed(2)}</strong></div></> : <><div><span>参考项目</span><strong>{referenceRows.length || "无"}</strong></div><div><span>模型</span><strong>{modelId || "仅规则抽取"}</strong></div><div><span>外部搜索</span><strong>{searchIds.length} 个</strong></div><div><span>并行 MCP</span><strong>{mcpIds.length} 个</strong></div></>}
             </div>
           </div>
         )}
@@ -540,7 +585,7 @@ function ScanWizard({ fields, sources, providers, searchProviders, mcpServers, o
           <button className="ghost" disabled={step === 1} onClick={() => setStep((value) => Math.max(1, value - 1))}>← 上一步</button>
           {step < 5
             ? <button className="primary" onClick={() => setStep((value) => Math.min(5, value + 1))}>下一步 →</button>
-            : <button className="primary launch" disabled={busy || !fieldIds.length || (acquisitionMode === "web" && !sourceIds.length)} onClick={() => void start()}>{busy ? "正在创建…" : acquisitionMode === "project-intel" ? "启动批量采集" : "启动监测与爬取"}</button>}
+            : <button className="primary launch" disabled={busy || (wechatOutputMode !== "fulltext" && !fieldIds.length) || (acquisitionMode === "web" && !sourceIds.length) || (acquisitionMode === "wechat" && (!wechatProviderId || !sourceIds.length || (wechatOutputMode === "projects" && (!providerId || !modelId))))} onClick={() => void start()}>{busy ? "正在创建…" : acquisitionMode === "project-intel" ? "启动批量采集" : acquisitionMode === "wechat" ? "启动微信公众号监测" : "启动监测与爬取"}</button>}
         </div>
       </section>
     </div>
@@ -561,6 +606,11 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
   const [repairingBilingual, setRepairingBilingual] = useState("");
   const [assessingPending, setAssessingPending] = useState(false);
   const [approvingAll, setApprovingAll] = useState(false);
+  const [fullTexts, setFullTexts] = useState<Record<string, { title: string; url: string; publishedAt?: string; text: string; warnings?: string[] }>>({});
+  const [loadingFullText, setLoadingFullText] = useState("");
+  const isWechatScan = activeScan?.request?.acquisitionMode === "wechat";
+  const activeWechatRequest = activeScan?.request?.wechat && typeof activeScan.request.wechat === "object" ? activeScan.request.wechat as Json : undefined;
+  const isWechatFullTextMode = isWechatScan && activeWechatRequest?.outputMode === "fulltext";
   const filtered = results.filter((result) => filter === "all" || result.status === filter);
   const unresolvedResults = results.filter((result) => !["approved", "auto_approved"].includes(result.status));
   const visibleLogs = logs.filter((log) => (logLevel === "all" || log.level === logLevel) && (logStage === "all" || log.stage === logStage));
@@ -584,7 +634,7 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
     baselineScanId: historicalBaseline.id, baselineResultCount: Number(historicalBaseline.progress.results ?? 0),
   } : undefined);
   const recallRegression = recall?.status === "regressed";
-  const zeroResultInsight = activeScan && ["completed", "failed", "stopped"].includes(activeScan.status) && results.length === 0
+  const zeroResultInsight = activeScan && !isWechatFullTextMode && ["completed", "failed", "stopped"].includes(activeScan.status) && results.length === 0
     ? (() => {
         const progress = activeScan.progress;
         const selected = Array.isArray(activeScan.request?.sourceIds) ? activeScan.request.sourceIds.length : Number(progress.sourcesTotal ?? 0);
@@ -592,6 +642,14 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
         const fetched = Number(progress.pagesFetched ?? 0);
         const within = Number(progress.withinRange ?? 0);
         const modelCalls = Number(progress.modelExtractions ?? 0);
+        if (activeScan.request?.acquisitionMode === "wechat") {
+          const examined = Number(progress.wechatArticlesExamined ?? 0);
+          const fullText = Number(progress.fullTextSucceeded ?? 0);
+          const cost = Number(progress.dajialaApiCostCny ?? 0).toFixed(2);
+          if (fullText === 0) return `大家啦 API 共检查 ${examined} 篇文章，但没有获得所选日期范围内的可用全文；本次接口花费 ¥${cost}。请检查账号定位、日期、API 余额和任务日志。`;
+          if (modelCalls === 0) return `已获得 ${fullText} 篇微信全文，但模型没有完成调用；请检查模型供应商、模型选择和密钥。`;
+          return `已对 ${fullText} 篇微信全文完成 ${modelCalls} 次模型理解，但没有形成满足海外项目与字段证据要求的结果。`;
+        }
         const singleDay = activeScan.request?.startDate === activeScan.request?.endDate;
         if (within === 0) return `实际扫描 ${scanned}/${selected} 个来源、抓取 ${fetched} 页，但没有网页发布日期落在所选${singleDay ? "单日" : "时间范围"}内，因此模型调用为 ${modelCalls}，项目判定阶段没有输入。`;
         if (modelCalls === 0) return `已有 ${within} 篇范围内页面，但模型没有被调用；请检查模型选择和分类日志。`;
@@ -675,6 +733,15 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
     } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setRepairingBilingual(""); }
   }
+  async function loadFullText(result: Result) {
+    if (!result.documentId || fullTexts[result.documentId]) return;
+    setLoadingFullText(result.documentId);
+    try {
+      const content = await api<{ title: string; url: string; publishedAt?: string; text: string; warnings?: string[] }>(`/api/documents/${result.documentId}/fulltext`);
+      setFullTexts((current) => ({ ...current, [result.documentId!]: content }));
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setLoadingFullText(""); }
+  }
   return (
     <div className="stack">
       {recallRegression && <section className="recall-warning panel">
@@ -685,14 +752,15 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
       </section>}
       <section className="task-bar panel">
         <label><span>监测任务</span><select value={activeScanId} onChange={(e) => setActiveScanId(e.target.value)}><option value="">选择任务</option>{scans.map((scan) => <option key={scan.id} value={scan.id}>{scan.id.slice(0, 8)} · {statusLabel(scan.status)}</option>)}</select></label>
-        {activeScan && <><ProgressRing value={Number(activeScan.progress.percent ?? 0)} /><div className="task-summary"><strong>{statusLabel(activeScan.status)}</strong><span>{Number(activeScan.progress.pagesDiscovered ?? 0)} 个文章链接 · {Number(activeScan.progress.pagesFetched ?? 0)} 页已抓取 · {Number(activeScan.progress.withinRange ?? 0)} 篇在时间范围内 · {Number(activeScan.progress.results ?? 0)} 个项目</span><small>网站处理 {Number(sourceCoverage?.settled ?? activeScan.progress.sourcesScanned ?? 0)}/{Number(sourceCoverage?.total ?? activeScan.progress.sourcesTotal ?? 0)} · 成功 {Number(sourceCoverage?.succeeded ?? 0)} · 失败 {Number(sourceCoverage?.failed ?? 0)} · 全文成功 {Number(activeScan.progress.fullTextSucceeded ?? 0)} · 动态渲染 {Number(activeScan.progress.dynamicPages ?? 0)} · MCP {Number(activeScan.progress.mcpCalls ?? 0)}/{Number(activeScan.progress.mcpFailures ?? 0)} · 日期不明/冲突 {Number(activeScan.progress.dateUnknown ?? 0)}/{Number(activeScan.progress.dateConflict ?? 0)} · 非项目/待复核 {Number(activeScan.progress.nonProjectArticles ?? 0)}/{Number(activeScan.progress.uncertainArticles ?? 0)} · 失败事件 {Number(activeScan.progress.failures ?? 0)}</small></div><div className="scan-controls">{activeScan.status === "running" && <button className="ghost small" onClick={() => void control("pause")}>Ⅱ 暂停</button>}{activeScan.status === "paused" && <button className="primary small" onClick={() => void control("resume")}>▶ 继续</button>}{["queued","running","paused"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void control("stop")}>■ 停止</button>}{["failed","stopped"].includes(activeScan.status) && (Number(activeScan.progress.withinRange ?? 0) + Number(activeScan.progress.dateUnknown ?? 0) + Number(activeScan.progress.dateConflict ?? 0)) > 0 && <button className="primary small" disabled={assessingPending} onClick={() => void assessPending()}>{assessingPending ? "评估中…" : "⇪ 补跑评估"}</button>}{["completed","failed","stopped"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void removeScan()}>⌫ 删除任务</button>}</div></>}
+        {activeScan && <><ProgressRing value={Number(activeScan.progress.percent ?? 0)} /><div className="task-summary"><strong>{statusLabel(activeScan.status)}</strong><span>{isWechatScan ? `${Number(activeScan.progress.wechatArticlesExamined ?? 0)} 篇已检查 · ${Number(activeScan.progress.fullTextSucceeded ?? 0)} 篇全文 · ${Number(activeScan.progress.withinRange ?? 0)} 篇在时间范围内${isWechatFullTextMode ? " · 全文归档模式" : ` · ${Number(activeScan.progress.results ?? 0)} 个项目`}` : `${Number(activeScan.progress.pagesDiscovered ?? 0)} 个文章链接 · ${Number(activeScan.progress.pagesFetched ?? 0)} 页已抓取 · ${Number(activeScan.progress.withinRange ?? 0)} 篇在时间范围内 · ${Number(activeScan.progress.results ?? 0)} 个项目`}</span><small>{isWechatScan ? `大家啦 API ¥${Number(activeScan.progress.dajialaApiCostCny ?? 0).toFixed(2)} · 余额 ${activeScan.progress.dajialaRemainMoney == null ? "未返回" : `¥${Number(activeScan.progress.dajialaRemainMoney).toFixed(2)}`} · ${isWechatFullTextMode ? "未调用大模型" : `模型理解 ${Number(activeScan.progress.modelExtractions ?? 0)} · 项目提及 ${Number(activeScan.progress.projectMentions ?? 0)}`} · 失败 ${Number(activeScan.progress.failures ?? 0)}` : `网站处理 ${Number(sourceCoverage?.settled ?? activeScan.progress.sourcesScanned ?? 0)}/${Number(sourceCoverage?.total ?? activeScan.progress.sourcesTotal ?? 0)} · 成功 ${Number(sourceCoverage?.succeeded ?? 0)} · 失败 ${Number(sourceCoverage?.failed ?? 0)} · 全文成功 ${Number(activeScan.progress.fullTextSucceeded ?? 0)} · 动态渲染 ${Number(activeScan.progress.dynamicPages ?? 0)} · MCP ${Number(activeScan.progress.mcpCalls ?? 0)}/${Number(activeScan.progress.mcpFailures ?? 0)} · 日期不明/冲突 ${Number(activeScan.progress.dateUnknown ?? 0)}/${Number(activeScan.progress.dateConflict ?? 0)} · 非项目/待复核 ${Number(activeScan.progress.nonProjectArticles ?? 0)}/${Number(activeScan.progress.uncertainArticles ?? 0)} · 失败事件 ${Number(activeScan.progress.failures ?? 0)}`}</small></div><div className="scan-controls">{activeScan.status === "running" && <button className="ghost small" onClick={() => void control("pause")}>Ⅱ 暂停</button>}{activeScan.status === "paused" && <button className="primary small" onClick={() => void control("resume")}>▶ 继续</button>}{["queued","running","paused"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void control("stop")}>■ 停止</button>}{!isWechatFullTextMode && ["failed","stopped"].includes(activeScan.status) && (Number(activeScan.progress.withinRange ?? 0) + Number(activeScan.progress.dateUnknown ?? 0) + Number(activeScan.progress.dateConflict ?? 0)) > 0 && <button className="primary small" disabled={assessingPending} onClick={() => void assessPending()}>{assessingPending ? "评估中…" : "⇪ 补跑评估"}</button>}{["completed","failed","stopped"].includes(activeScan.status) && <button className="danger-ghost small" onClick={() => void removeScan()}>⌫ 删除任务</button>}</div></>}
       </section>
       {sourceCoverage && <section className={`source-coverage panel ${Number(sourceCoverage.failed ?? 0) > 0 ? "has-failures" : ""}`}>
-        <div className="source-coverage-head"><div><strong>选定网站覆盖</strong><p>{Boolean(sourceCoverage.allSettled) ? `全部 ${Number(sourceCoverage.total ?? 0)} 个网站均已完成处理；失败网站不会被记作成功，但也不会阻断其他网站。` : `正在处理：已结算 ${Number(sourceCoverage.settled ?? 0)}/${Number(sourceCoverage.total ?? 0)} 个网站。任务只有在全部结算后才能完成。`}</p></div><div><span className="ok">成功 {Number(sourceCoverage.succeeded ?? 0)}</span><span className="bad">失败 {Number(sourceCoverage.failed ?? 0)}</span><span>运行中 {Number(sourceCoverage.running ?? 0)}</span><span>待处理 {Number(sourceCoverage.pending ?? 0)}</span></div></div>
+        <div className="source-coverage-head"><div><strong>{isWechatScan ? "公众号账号处理" : "选定网站覆盖"}</strong><p>{isWechatScan ? `按已导入账号读取历史文章并取得全文；${isWechatFullTextMode ? "本任务直接归档，不进行项目分析。" : "随后由大模型按现有项目字段分析。"}` : Boolean(sourceCoverage.allSettled) ? `全部 ${Number(sourceCoverage.total ?? 0)} 个网站均已完成处理；失败网站不会被记作成功，但也不会阻断其他网站。` : `正在处理：已结算 ${Number(sourceCoverage.settled ?? 0)}/${Number(sourceCoverage.total ?? 0)} 个网站。任务只有在全部结算后才能完成。`}</p></div><div><span className="ok">成功 {Number(sourceCoverage.succeeded ?? 0)}</span><span className="bad">失败 {Number(sourceCoverage.failed ?? 0)}</span><span>运行中 {Number(sourceCoverage.running ?? 0)}</span><span>待处理 {Number(sourceCoverage.pending ?? 0)}</span></div></div>
         <details><summary>查看全部网站状态与失败原因</summary><div className="source-coverage-list">{sourceCoverageItems.map((source) => <article className={source.status} key={source.sourceId}><span>{source.status === "completed" ? "✓" : source.status === "failed" ? "!" : source.status === "running" ? "↻" : "·"}</span><div><strong>{source.name}</strong><small>{source.url || source.sourceId}</small><p>发现 {source.discovered} · 抓取 {source.fetched} · 正文成功 {source.succeeded}{source.error ? ` · ${source.error}` : ""}</p></div></article>)}</div></details>
       </section>}
       {(activeScan?.error || Object.keys(failureReasons).length > 0) && <section className="failure-summary panel"><div><span>!</span><strong>{activeScan?.status === "failed" ? "任务失败原因" : "已记录的失败分类"}</strong></div>{activeScan?.error && <p>{activeScan.error}</p>}<div className="failure-chips">{Object.entries(failureReasons).map(([reason, count]) => <button className={selectedFailure === reason ? "active" : ""} key={reason} onClick={() => setSelectedFailure(selectedFailure === reason ? "" : reason)}>{failureReasonLabel(reason)} · {count}</button>)}</div>{selectedFailure && <div className="failure-detail"><div className="failure-detail-head"><div><strong>{failureReasonLabel(selectedFailure)}明细</strong><p>显示可审计原始错误、来源和网址，可据此修订信息源或生成 Skill 迭代建议。</p></div><div><button className="ghost small" onClick={onOpenSources}>修改信息源</button><button className="primary small" onClick={onOpenSkill}>交给 Skill 优化</button></div></div>{failureDetails.length ? <div className="failure-detail-list">{failureDetails.map((log) => <details key={log.id}><summary><span>{log.context.source ? String(log.context.source) : log.stage}</span><strong>{log.message.split("\n")[0]}</strong><time>{new Date(log.createdAt).toLocaleString("zh-CN")}</time></summary><dl><div><dt>阶段/事件</dt><dd>{log.stage} / {log.event}</dd></div>{Boolean(log.context.url) && <div><dt>网址</dt><dd><a href={String(log.context.url)} target="_blank" rel="noreferrer">{String(log.context.url)}</a></dd></div>}{log.context.attempts != null && <div><dt>尝试次数</dt><dd>{String(log.context.attempts)}</dd></div>}{Boolean(log.context.method) && <div><dt>采集方式</dt><dd>{String(log.context.method)}</dd></div>}<div><dt>完整错误</dt><dd><pre>{log.message}</pre></dd></div></dl></details>)}</div> : <p className="muted">当前日志中没有与该分类逐条对应的记录；可在下方完整日志中继续筛选。</p>}</div>}</section>}
       {zeroResultInsight && <section className="zero-result-insight panel"><strong>为什么没有结果</strong><p>{zeroResultInsight}</p></section>}
+      {isWechatFullTextMode && <section className="info-card panel"><span>文</span><div><strong>全文归档任务不生成项目审核结果</strong><p>已归档 {Number(activeScan?.progress.fullTextSucceeded ?? 0)} 篇文章。请到“确认与导出”输出公众号账号、发布日期、文章标题、正文四列。</p></div></section>}
       <section className="panel">
         <div className="results-toolbar" id="structured-results">
           <div><h2>结构化结果</h2><p>点击一行查看字段证据、候选链接与冲突。</p></div>
@@ -706,7 +774,7 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
           </div>
         </div>
         {!activeScanId && <Empty text="请先选择一个监测任务。" />}
-        {activeScanId && filtered.length === 0 && <Empty text={activeScan?.status === "running" ? "监测仍在进行，结果会自动出现。" : "该筛选条件下没有结果。"} />}
+        {activeScanId && filtered.length === 0 && !isWechatFullTextMode && <Empty text={activeScan?.status === "running" ? "监测仍在进行，结果会自动出现。" : "该筛选条件下没有结果。"} />}
         <div className="result-list">
           {filtered.map((result) => (
             <article id={`result-${result.id}`} className={expanded === result.id ? "result-card expanded" : "result-card"} key={result.id}>
@@ -720,10 +788,10 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
                 <div className="result-detail" id={`result-detail-${result.id}`}>
                   <div className="evidence-grid">
                     <section><h3>{isForeignResult(result) ? "字段双语对照与验证" : "字段与证据"}</h3>{fields.filter((field) => hasDisplayValue(result.fields[field.id]) || hasDisplayValue(result.originalFields?.[field.id])).map((field) => <div className="evidence-row" key={field.id}><span>{field.label.replace("\n"," ")}</span><strong>{isForeignResult(result) && <small className="language-label">中文提炼</small>}<b>{String(result.fields[field.id] ?? "待补齐")}</b>{result.generatedFields?.includes(field.id) && <em className="generated-badge">提炼</em>}{isForeignResult(result) ? <small lang={result.sourceLanguage === "foreign" ? undefined : result.sourceLanguage}>原文（{(result.sourceLanguage ?? "original").toUpperCase()}）：{result.originalFields?.[field.id] || "原文未单独给出"}</small> : bilingualOriginal(result, field.id) && <small>原文：{result.originalFields?.[field.id]}</small>}</strong><div className="bilingual-evidence"><p><i>原文证据</i><EvidenceText text={result.evidence[field.id] || "该字段暂无截取证据，建议人工查看原文。"} values={evidenceValues(result, field.id)} /></p>{isForeignResult(result) ? <p className={result.evidenceTranslations?.[field.id] ? "translation" : "translation missing"}><i>中文验证</i>{result.evidenceTranslations?.[field.id] || "翻译待自动补齐；当前结果应人工复核"}</p> : result.evidenceTranslations?.[field.id] && result.evidenceTranslations[field.id] !== result.evidence[field.id] && <p className="translation"><i>中文验证</i>{result.evidenceTranslations[field.id]}</p>}{result.unitChecks?.[field.id] && <p className={result.unitChecks[field.id].startsWith("未通过") ? "unit-check bad" : "unit-check"}><i>单位核验</i>{result.unitChecks[field.id]}</p>}</div></div>)}</section>
-                    <section><h3>来源与判断</h3><a className="source-link" href={result.primaryUrl || undefined} target="_blank" rel="noreferrer">{result.primaryUrl || "尚未找到可靠主链接"}</a><p className="muted">候选页面：{result.candidateUrls.length} 个</p>{result.conflicts.length > 0 && <div className="conflict-box"><strong>需要注意</strong>{result.conflicts.map((item) => <p key={item}>• {item}</p>)}</div>}</section>
+                    <section><h3>来源与判断</h3><a className="source-link" href={result.primaryUrl || undefined} target="_blank" rel="noreferrer">{result.primaryUrl || "尚未找到可靠主链接"}</a><p className="muted">候选页面：{result.candidateUrls.length} 个</p>{isWechatScan && result.documentId && <div className="wechat-fulltext"><button className="ghost small" disabled={loadingFullText === result.documentId} onClick={() => void loadFullText(result)}>{loadingFullText === result.documentId ? "正在读取全文…" : fullTexts[result.documentId] ? "已加载微信全文" : "查看存档微信全文"}</button>{fullTexts[result.documentId] && <details><summary>{fullTexts[result.documentId].title || "微信文章全文"} · {fullTexts[result.documentId].publishedAt || "日期不明"}</summary><pre>{fullTexts[result.documentId].text}</pre></details>}</div>}{result.conflicts.length > 0 && <div className="conflict-box"><strong>需要注意</strong>{result.conflicts.map((item) => <p key={item}>• {item}</p>)}</div>}</section>
                   </div>
                   <div className="result-actions">
-                    <button className="ghost" onClick={() => void deep(result.id)}>⌕ 二次深度扩散</button>
+                    {!isWechatScan && <button className="ghost" onClick={() => void deep(result.id)}>⌕ 二次深度扩散</button>}
                     {isForeignResult(result) && <button className="ghost" disabled={repairingBilingual === result.id} onClick={() => void repairBilingual(result.id)}>{repairingBilingual === result.id ? "正在补齐双语…" : "中/EN 自动补齐双语"}</button>}
                     <button className="danger-ghost" onClick={() => void decide(result.id, "rejected")}>驳回</button>
                     <button className="primary" onClick={() => void decide(result.id, "approved")}>确认结果</button>
@@ -745,6 +813,10 @@ function ResultsView({ scans, activeScan, activeScanId, setActiveScanId, results
 function SourcesView({ sources, refresh, notify, onError }: { sources: Source[]; refresh: () => Promise<void>; notify: (message: string) => void; onError: (message: string) => void }) {
   const blankSource = { id: "", name: "", url: "", coverage: "", type: "网址", enabled: true };
   const [form, setForm] = useState(blankSource);
+  const [kind, setKind] = useState<"website" | "wechat">("website");
+  const [accountMode, setAccountMode] = useState<"url" | "ghid">("url");
+  const [accountIdentifier, setAccountIdentifier] = useState("");
+  const [accountBatch, setAccountBatch] = useState("");
   const [checks, setChecks] = useState<Record<string, Json>>({});
   const [checking, setChecking] = useState<Record<string, boolean>>({});
   async function check(source: Source) {
@@ -766,39 +838,83 @@ function SourcesView({ sources, refresh, notify, onError }: { sources: Source[];
   }
   async function add() {
     try {
-      await api(form.id ? `/api/sources/${form.id}` : "/api/sources", { method: form.id ? "PUT" : "POST", body: JSON.stringify(form) });
-      setForm(blankSource); notify(form.id ? "信息源修改已保存" : "来源已添加"); await refresh();
+      const payload = kind === "wechat" ? { ...form, type: "微信公众号", url: accountMode === "url" ? accountIdentifier.trim() : `wechat://${accountMode}/${encodeURIComponent(accountIdentifier.trim())}` } : form;
+      await api(form.id ? `/api/sources/${form.id}` : "/api/sources", { method: form.id ? "PUT" : "POST", body: JSON.stringify(payload) });
+      setForm(blankSource); setAccountIdentifier(""); notify(form.id ? "信息源修改已保存" : kind === "wechat" ? "公众号账号已导入" : "来源已添加"); await refresh();
     }
     catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
   }
-  function edit(source: Source) { setForm({ id: source.id, name: source.name, url: source.url, coverage: source.coverage, type: source.type, enabled: source.enabled }); }
+  function edit(source: Source) {
+    const isWechat = source.type === "微信公众号";
+    setKind(isWechat ? "wechat" : "website");
+    setForm({ id: source.id, name: source.name, url: source.url, coverage: source.coverage, type: source.type, enabled: source.enabled });
+    if (isWechat) {
+      const matched = source.url.match(/^wechat:\/\/(ghid)\/(.+)$/i);
+      setAccountMode(matched ? "ghid" : "url");
+      setAccountIdentifier(matched ? decodeURIComponent(matched[2]) : source.url);
+    }
+  }
+  async function importAccounts() {
+    const rows = accountBatch.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
+      const [name, identifier = ""] = line.split(/\s*[|,，\t]\s*/, 2);
+      const url = /^https?:\/\/mp\.weixin\.qq\.com\//i.test(identifier) ? identifier : `wechat://ghid/${encodeURIComponent(identifier)}`;
+      return { name, identifier, url };
+    });
+    if (!rows.length) return onError("请至少粘贴一行公众号账号");
+    try {
+      let inserted = 0;
+      for (const row of rows) {
+        await api("/api/sources", { method: "POST", body: JSON.stringify({ name: row.name, type: "微信公众号", url: row.url, coverage: "公众号历史文章", enabled: true }) });
+        inserted++;
+      }
+      setAccountBatch(""); await refresh(); notify(`已导入 ${inserted} 个公众号账号`);
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+  }
   async function remove(source: Source) {
     if (!window.confirm(`确定删除信息源“${source.name}”吗？\n\n历史任务与已采集网页不会被删除。`)) return;
     try { await api(`/api/sources/${source.id}`, { method: "DELETE" }); if (form.id === source.id) setForm(blankSource); notify("信息源已删除"); await refresh(); }
     catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
   }
   return (
+    <div className="stack">
+      <div className="period-mode" role="tablist" aria-label="来源类型"><button className={kind === "website" ? "active" : ""} onClick={() => { setKind("website"); setForm(blankSource); }}>网站来源（{sources.filter((source) => source.type !== "微信公众号").length}）</button><button className={kind === "wechat" ? "active" : ""} onClick={() => { setKind("wechat"); setForm({ ...blankSource, type: "微信公众号" }); }}>微信公众号（{sources.filter((source) => source.type === "微信公众号").length}）</button></div>
     <div className="two-col settings-cols">
       <section className="panel">
-        <PanelHeader title="来源库" subtitle={`${sources.length} 个可监测站点`} />
-        <div className="settings-list">{sources.map((source) => <div key={source.id}><div className="settings-row"><span className="source-logo">{source.name.slice(0,1)}</span><div><strong>{source.name}</strong><p>{source.url}</p>{source.coverage && <small>{source.coverage}</small>}</div><StatusPill status={source.enabled ? "approved" : "rejected"} /><div className="row-actions"><button className="ghost small" disabled={Boolean(checking[source.id])} onClick={() => void check(source)}>{checking[source.id] ? "体检中…" : "体检"}</button><button className="ghost small" onClick={() => edit(source)}>编辑</button><button className="danger-ghost small" onClick={() => void remove(source)}>删除</button></div></div>{checks[source.id] && <pre className="test-result">{JSON.stringify(checks[source.id], null, 2)}</pre>}</div>)}</div>
+        <PanelHeader title={kind === "wechat" ? "公众号账号库" : "网站来源库"} subtitle={kind === "wechat" ? "这些账号可在新建微信监测时多选" : "用于多来源网页监测"} />
+        <div className="settings-list">{sources.filter((source) => kind === "wechat" ? source.type === "微信公众号" : source.type !== "微信公众号").map((source) => <div key={source.id}><div className="settings-row"><span className="source-logo">{kind === "wechat" ? "微" : source.name.slice(0,1)}</span><div><strong>{source.name}</strong><p>{source.url.replace(/^wechat:\/\/ghid\//, "")}</p>{source.coverage && <small>{source.coverage}</small>}</div><StatusPill status={source.enabled ? "approved" : "rejected"} /><div className="row-actions"><button className="ghost small" disabled={Boolean(checking[source.id])} onClick={() => void check(source)}>{checking[source.id] ? "体检中…" : "体检"}</button><button className="ghost small" onClick={() => edit(source)}>编辑</button><button className="danger-ghost small" onClick={() => void remove(source)}>删除</button></div></div>{checks[source.id] && <pre className="test-result">{JSON.stringify(checks[source.id], null, 2)}</pre>}</div>)}</div>
       </section>
       <section className="stack">
-        <div className="panel form-card">
+        {kind === "website" ? <div className="panel form-card">
           <h2>批量导入</h2><p>支持当前“信息源名称、信息源类型、覆盖范围、网址、提出者”格式，也支持 CSV。</p>
           <label className="upload-box"><input type="file" accept=".xlsx,.csv" onChange={(e) => void upload(e.target.files?.[0])} /><span>⇧</span><div><strong>选择 XLSX 或 CSV</strong><p>系统会裁剪异常空白行、补全网址协议并跳过重复来源</p></div></label>
-        </div>
+        </div> : <div className="panel form-card"><h2>批量导入公众号</h2><p>每行填写“显示名称 | 账号标识”。账号标识使用该账号任意一篇文章链接，或 gh_ 开头的公众号原始 ID。</p><label><span>公众号列表</span><textarea value={accountBatch} onChange={(event) => setAccountBatch(event.target.value)} placeholder={"海外电力观察 | https://mp.weixin.qq.com/s/...\n储能前沿 | gh_xxxxxxxxxxxx"} /></label><button className="ghost full" onClick={() => void importAccounts()}>导入这些账号</button></div>}
         <div className="panel form-card">
-          <div className="form-card-head"><div><h2>{form.id ? "修改信息源" : "手工添加"}</h2><p>{form.id ? "修改会用于后续监测，历史任务保持原样。" : "补充单个监测站点。"}</p></div>{form.id && <button className="ghost small" onClick={() => setForm(blankSource)}>取消编辑</button>}</div>
-          <label><span>来源名称</span><input value={form.name} onChange={(e) => setForm({...form,name:e.target.value})} placeholder="例如：中国能建" /></label>
-          <label><span>网址</span><input value={form.url} onChange={(e) => setForm({...form,url:e.target.value})} placeholder="https://…" /></label>
+          <div className="form-card-head"><div><h2>{form.id ? "修改信息源" : kind === "wechat" ? "导入单个公众号" : "手工添加"}</h2><p>{form.id ? "修改会用于后续监测，历史任务保持原样。" : kind === "wechat" ? "建议用任意文章链接精确定位同名账号。" : "补充单个监测站点。"}</p></div>{form.id && <button className="ghost small" onClick={() => { setForm(blankSource); setAccountIdentifier(""); }}>取消编辑</button>}</div>
+          <label><span>{kind === "wechat" ? "公众号显示名称" : "来源名称"}</span><input value={form.name} onChange={(e) => setForm({...form,name:e.target.value})} placeholder={kind === "wechat" ? "例如：海外电力观察" : "例如：中国能建"} /></label>
+          {kind === "wechat" ? <><label><span>账号定位方式</span><select value={accountMode} onChange={(event) => setAccountMode(event.target.value as "url" | "ghid")}><option value="url">任意文章链接（推荐）</option><option value="ghid">公众号原始 ID（ghid）</option></select></label><label><span>账号标识</span><input value={accountIdentifier} onChange={(event) => setAccountIdentifier(event.target.value)} placeholder={accountMode === "url" ? "https://mp.weixin.qq.com/s/..." : "gh_xxxxxxxxxxxx"} /></label></> : <label><span>网址</span><input value={form.url} onChange={(e) => setForm({...form,url:e.target.value})} placeholder="https://…" /></label>}
           <label><span>覆盖范围</span><textarea value={form.coverage} onChange={(e) => setForm({...form,coverage:e.target.value})} placeholder="说明这个来源适合监测的内容" /></label>
           <label className="source-enabled"><input type="checkbox" checked={form.enabled} onChange={(e) => setForm({...form,enabled:e.target.checked})} /><span>用于后续监测</span></label>
-          <button className="primary full" onClick={() => void add()}>{form.id ? "保存修改" : "保存来源"}</button>
+          <button className="primary full" onClick={() => void add()}>{form.id ? "保存修改" : kind === "wechat" ? "导入公众号账号" : "保存来源"}</button>
         </div>
       </section>
     </div>
+    </div>
   );
+}
+
+function connectionErrorMessage(message: string) {
+  if (/405|not allowed/i.test(message)) return "服务地址或请求方式不匹配。请确认 Base URL 后重新检测。";
+  if (/API Key|key或附加码|10002|unauthorized|401/i.test(message)) return "访问密钥、Token 或附加码未通过验证，请检查后重新保存。";
+  if (/余额不足|20001/i.test(message)) return "接口账户余额不足，需要充值后才能继续使用。";
+  if (/timeout|timed out|超时/i.test(message)) return "服务响应超时。请检查网络，稍后重新检测。";
+  if (/fetch failed|network|connect|ENOTFOUND|ECONN/i.test(message)) return "暂时无法连接远端服务，请检查网络、代理或服务地址。";
+  return "连接没有通过。可以检查配置后重新检测，技术详情已折叠保留。";
+}
+
+function connectionStage(kind: "dajiala" | "search" | "browser", elapsed: number) {
+  if (elapsed < 2) return kind === "dajiala" ? "正在安全读取本地密钥" : "正在准备连接参数";
+  if (elapsed < 5) return kind === "dajiala" ? "正在连接大家啦余额服务" : kind === "browser" ? "正在联系渲染服务" : "正在发送测试搜索";
+  return "远端响应较慢，仍在等待，请不要关闭页面";
 }
 
 function ModelsView({ providers, refresh, notify, onError }: { providers: Provider[]; refresh: () => Promise<void>; notify: (message: string) => void; onError: (message: string) => void }) {
@@ -910,29 +1026,61 @@ function ModelsView({ providers, refresh, notify, onError }: { providers: Provid
 }
 
 function SearchView({ providers, refresh, notify, onError }: { providers: SearchProvider[]; refresh: () => Promise<void>; notify: (message: string) => void; onError: (message: string) => void }) {
-  const [form, setForm] = useState({ name: "Tavily", kind: "tavily", endpoint: "https://api.tavily.com/search", method: "POST", apiKey: "" });
-  const [tests, setTests] = useState<Record<string, Json>>({});
+  const [form, setForm] = useState({ name: "Tavily", kind: "tavily", endpoint: "https://api.tavily.com/search", method: "POST", apiKey: "", verifycode: "" });
+  const [tests, setTests] = useState<Record<string, ConnectionTestState>>({});
+  const [testClock, setTestClock] = useState(0);
+  useEffect(() => {
+    if (!Object.values(tests).some((item) => item.status === "running")) return;
+    const timer = window.setInterval(() => setTestClock(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, [tests]);
+  function chooseKind(kind: string) {
+    if (kind === "dajiala") setForm({ ...form, kind, name: "大家啦微信内容", endpoint: "https://www.dajiala.com", method: "POST" });
+    else if (kind === "tavily") setForm({ ...form, kind, name: "Tavily", endpoint: "https://api.tavily.com/search", method: "POST", verifycode: "" });
+    else setForm({ ...form, kind, name: "通用 REST 搜索", endpoint: "", method: "POST", verifycode: "" });
+  }
   async function save() {
-    try { await api("/api/search-providers", { method: "POST", body: JSON.stringify(form) }); notify("搜索供应商已保存"); await refresh(); }
+    try { await api("/api/search-providers", { method: "POST", body: JSON.stringify(form) }); notify(form.kind === "dajiala" ? "微信内容 API 已加密保存" : "搜索供应商已保存"); setForm({ ...form, apiKey: "", verifycode: "" }); await refresh(); }
     catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
   }
   async function test(id: string) {
-    try { setTests({...tests,[id]:await api(`/api/search-providers/${id}/test`, { method: "POST", body: JSON.stringify({ query: "2026 海外 光伏 储能 EPC 项目" }) })}); }
-    catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    // Browser event timestamp drives the user-visible elapsed-time indicator.
+    // eslint-disable-next-line react-hooks/purity
+    const startedAt = Date.now();
+    setTestClock(startedAt);
+    setTests((current) => ({ ...current, [id]: { status: "running", startedAt } }));
+    try {
+      const result = await api<Json>(`/api/search-providers/${id}/test`, { method: "POST", body: JSON.stringify({ query: "2026 海外 光伏 储能 EPC 项目" }) });
+      setTests((current) => ({ ...current, [id]: { status: "success", startedAt, finishedAt: Date.now(), result } }));
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setTests((current) => ({ ...current, [id]: { status: "failed", startedAt, finishedAt: Date.now(), error: message } }));
+    }
   }
   return (
     <div className="two-col settings-cols">
       <section className="panel form-card">
-        <h2>新增搜索 API</h2><p>内置 Tavily，也可通过通用 REST 映射接入其他搜索服务。</p>
+        <h2>新增搜索与微信 API</h2><p>通用网页搜索用于官网监测；大家啦微信内容 API 用于已导入公众号账号的历史文章与全文获取。</p>
         <label><span>显示名称</span><input value={form.name} onChange={(e) => setForm({...form,name:e.target.value})} /></label>
-        <label><span>类型</span><select value={form.kind} onChange={(e) => setForm({...form,kind:e.target.value})}><option value="tavily">Tavily</option><option value="generic-rest">通用 REST</option></select></label>
-        <label><span>请求地址</span><input value={form.endpoint} onChange={(e) => setForm({...form,endpoint:e.target.value})} /></label>
-        <label><span>API Key</span><input type="password" value={form.apiKey} onChange={(e) => setForm({...form,apiKey:e.target.value})} /></label>
-        <button className="primary full" onClick={() => void save()}>保存搜索能力</button>
+        <label><span>类型</span><select value={form.kind} onChange={(e) => chooseKind(e.target.value)}><option value="tavily">Tavily</option><option value="generic-rest">通用 REST</option><option value="dajiala">大家啦微信内容</option></select></label>
+        <label><span>{form.kind === "dajiala" ? "服务 Base URL" : "请求地址"}</span><input value={form.endpoint} onChange={(e) => setForm({...form,endpoint:e.target.value})} /></label>
+        <label><span>API Key</span><input type="password" autoComplete="new-password" value={form.apiKey} onChange={(e) => setForm({...form,apiKey:e.target.value})} placeholder="仅在本机加密保存" /></label>
+        {form.kind === "dajiala" && <><label><span>附加码 verifycode（可选）</span><input type="password" autoComplete="new-password" value={form.verifycode} onChange={(e) => setForm({...form,verifycode:e.target.value})} placeholder="账号未启用附加码时留空" /></label><div className="info-card"><span>¥</span><div><strong>保存后可检测余额</strong><p>检测使用免费余额接口；运行任务时会记录每次响应的本次花费和剩余余额，API Key 与附加码不会写入任务日志。</p></div></div></>}
+        <button className="primary full" disabled={!form.name.trim() || !form.endpoint.trim() || !form.apiKey.trim()} onClick={() => void save()}>{form.kind === "dajiala" ? "加密保存微信 API" : "保存搜索能力"}</button>
       </section>
       <section className="panel">
         <PanelHeader title="已配置的搜索能力" subtitle="检测延迟、额度和结果映射" />
-        <div className="settings-list">{providers.map((provider) => <div key={provider.id}><div className="settings-row"><span className="source-logo">S</span><div><strong>{provider.name}</strong><p>{provider.kind} · {provider.endpoint}</p></div><button className="ghost small" onClick={() => void test(provider.id)}>测试搜索</button></div>{tests[provider.id] && <pre className="test-result">{JSON.stringify(tests[provider.id], null, 2)}</pre>}</div>)}{!providers.length && <Empty text="还没有搜索 API。" />}</div>
+        <div className="settings-list">{providers.map((provider) => {
+          const state = tests[provider.id];
+          const elapsed = state ? Math.max(0, Math.floor(((state.finishedAt ?? testClock) - state.startedAt) / 1000)) : 0;
+          const result = state?.result ?? {};
+          const resultCount = Array.isArray(result.results) ? result.results.length : 0;
+          return <div className="connection-entry" key={provider.id}><div className="settings-row"><span className="source-logo">{provider.kind === "dajiala" ? "微" : "S"}</span><div><strong>{provider.name}</strong><p>{provider.kind === "dajiala" ? "微信公众号历史与全文服务" : "网页搜索服务"} · {provider.hasSecret ? "密钥已保存" : "缺少密钥"}{provider.hasVerifycode ? " · 附加码已保存" : ""}</p></div><button className="ghost small" disabled={state?.status === "running"} onClick={() => void test(provider.id)}>{state?.status === "running" ? `检测中 ${elapsed}s` : state ? "重新检测" : provider.kind === "dajiala" ? "检测余额" : "测试搜索"}</button></div>
+            {state?.status === "running" && <div className="connection-test-progress"><span /><div><strong>{connectionStage(provider.kind === "dajiala" ? "dajiala" : "search", elapsed)}</strong><p>已等待 {elapsed} 秒 · 检测期间不会产生文章抓取费用</p><i><b style={{ width: `${Math.min(92, 18 + elapsed * 11)}%` }} /></i></div></div>}
+            {state?.status === "success" && <div className="connection-test-card success"><div className="connection-test-head"><span>✓</span><div><strong>{provider.kind === "dajiala" ? "连接正常，余额读取成功" : "连接正常，测试搜索成功"}</strong><p>检测耗时 {elapsed < 1 ? "不到 1 秒" : `${elapsed} 秒`}</p></div></div>{provider.kind === "dajiala" ? <div className="connection-metrics"><div><small>当前可用余额</small><strong>¥{Number(result.remainMoney ?? 0).toFixed(3)}</strong></div><div><small>昨日余额</small><strong>¥{Number(result.yesterdayMoney ?? 0).toFixed(3)}</strong></div><div><small>服务返回时间</small><strong>{String(result.requestTime ?? "刚刚")}</strong></div></div> : <div className="connection-metrics"><div><small>测试结果</small><strong>{resultCount} 条</strong></div><div><small>连接状态</small><strong>可以使用</strong></div></div>}</div>}
+            {state?.status === "failed" && <div className="connection-test-card failed"><div className="connection-test-head"><span>!</span><div><strong>连接检测未通过</strong><p>{connectionErrorMessage(state.error ?? "")}</p></div></div><div className="connection-actions"><button className="ghost small" onClick={() => void test(provider.id)}>重新检测</button><details><summary>查看技术详情</summary><pre>{state.error}</pre></details></div></div>}
+          </div>;
+        })}{!providers.length && <Empty text="还没有搜索 API。" />}</div>
       </section>
     </div>
   );
@@ -944,6 +1092,15 @@ function BrowserView({ notify, onError }: { notify: (message: string) => void; o
   const [current, setCurrent] = useState<BrowserRendering | null>(null);
   const [probe, setProbe] = useState<BrowserProbe | null>(null);
   const [testing, setTesting] = useState(false);
+  const [testStartedAt, setTestStartedAt] = useState(0);
+  const [testFinishedAt, setTestFinishedAt] = useState(0);
+  const [testClock, setTestClock] = useState(0);
+  const [testError, setTestError] = useState("");
+  useEffect(() => {
+    if (!testing) return;
+    const timer = window.setInterval(() => setTestClock(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, [testing]);
 
   function composeEndpoint(values = form) {
     if (values.mode === "cloud") {
@@ -996,7 +1153,10 @@ function BrowserView({ notify, onError }: { notify: (message: string) => void; o
   }
 
   async function test() {
-    setTesting(true); setProbe(null);
+    // Browser event timestamp drives the user-visible elapsed-time indicator.
+    // eslint-disable-next-line react-hooks/purity
+    const startedAt = Date.now();
+    setTesting(true); setProbe(null); setTestError(""); setTestStartedAt(startedAt); setTestFinishedAt(0); setTestClock(startedAt);
     try {
       const result = await api<BrowserProbe>("/api/browser-rendering/test", {
         method: "POST",
@@ -1004,11 +1164,12 @@ function BrowserView({ notify, onError }: { notify: (message: string) => void; o
       });
       setProbe(result);
       if (result.ok) notify("Lightpanda 连接测试通过");
-    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
-    finally { setTesting(false); }
+    } catch (cause) { setTestError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setTestFinishedAt(Date.now()); setTesting(false); }
   }
 
   const sourceLabel = current?.source === "db" ? "设置页保存" : current?.source === "env" ? "环境变量" : "未配置";
+  const testElapsed = testStartedAt ? Math.max(0, Math.floor(((testing ? testClock : testFinishedAt) - testStartedAt) / 1000)) : 0;
   return (
     <div className="two-col settings-cols">
       <section className="panel form-card">
@@ -1036,8 +1197,10 @@ function BrowserView({ notify, onError }: { notify: (message: string) => void; o
           <div className="settings-row"><span className="source-logo">⇄</span><div><strong>兜底顺序</strong><p>{current ? current.backendOrder.map((item) => item === "local" ? "本机浏览器" : "Lightpanda").join(" → ") : "…"}</p></div></div>
           <div className="settings-row"><span className="source-logo">⚿</span><div><strong>Token</strong><p>{current?.hasToken ? "已加密保存（DPAPI）" : "未保存"} · 配置来源：{sourceLabel}</p></div></div>
         </div>
-        <button className="ghost small" disabled={testing} onClick={() => void test()}>{testing ? "正在连接…" : "测试连接"}</button>
-        {probe && <pre className="test-result">{JSON.stringify(probe, null, 2)}</pre>}
+        <button className="ghost small" disabled={testing} onClick={() => void test()}>{testing ? `正在测试 ${testElapsed}s` : probe || testError ? "重新测试连接" : "测试连接"}</button>
+        {testing && <div className="connection-test-progress browser-progress"><span /><div><strong>{connectionStage("browser", testElapsed)}</strong><p>已等待 {testElapsed} 秒 · 正在验证端点、Token 与浏览器会话</p><i><b style={{ width: `${Math.min(92, 18 + testElapsed * 10)}%` }} /></i></div></div>}
+        {probe && <div className={probe.ok ? "connection-test-card success browser-result" : "connection-test-card failed browser-result"}><div className="connection-test-head"><span>{probe.ok ? "✓" : "!"}</span><div><strong>{probe.ok ? "渲染服务连接正常" : "渲染服务未能建立连接"}</strong><p>{probe.ok ? "后续网页监测可以使用 Lightpanda 作为渲染兜底。" : connectionErrorMessage(probe.error || probe.diagnosis || "")}</p></div></div>{probe.ok && <div className="connection-metrics"><div><small>连接耗时</small><strong>{probe.latencyMs < 1000 ? `${probe.latencyMs} 毫秒` : `${(probe.latencyMs / 1000).toFixed(1)} 秒`}</strong></div><div><small>服务版本</small><strong>{probe.version || "兼容"}</strong></div><div><small>检测端点</small><strong>{probe.endpoint ? "配置有效" : "默认端点"}</strong></div></div>}{!probe.ok && <div className="connection-actions"><button className="ghost small" onClick={() => void test()}>重新检测</button><details><summary>查看技术详情</summary><pre>{probe.error || probe.diagnosis}</pre></details></div>}</div>}
+        {testError && <div className="connection-test-card failed browser-result"><div className="connection-test-head"><span>!</span><div><strong>连接检测未通过</strong><p>{connectionErrorMessage(testError)}</p></div></div><div className="connection-actions"><button className="ghost small" onClick={() => void test()}>重新检测</button><details><summary>查看技术详情</summary><pre>{testError}</pre></details></div></div>}
       </section>
     </div>
   );
@@ -1227,6 +1390,10 @@ function ExportsView({ activeScan, results, fields, notify, onError }: { activeS
   const [exported, setExported] = useState<{ location: string; files: string[]; verified: boolean } | null>(null);
   const [targetDirectory, setTargetDirectory] = useState<ExportTarget | null>(null);
   const [choosingDirectory, setChoosingDirectory] = useState(false);
+  const wechatRequest = activeScan?.request?.wechat && typeof activeScan.request.wechat === "object" ? activeScan.request.wechat as Json : undefined;
+  const fullTextMode = activeScan?.request?.acquisitionMode === "wechat" && wechatRequest?.outputMode === "fulltext";
+  const fullTextCount = Number(activeScan?.progress.fullTextSucceeded ?? 0);
+  const exportableCount = fullTextMode ? fullTextCount : results.length;
   const unresolved = results.filter((result) => !["approved","auto_approved"].includes(result.status)).length;
   async function chooseDirectory() {
     if (choosingDirectory) return;
@@ -1275,7 +1442,7 @@ function ExportsView({ activeScan, results, fields, notify, onError }: { activeS
   async function create() {
     if (!activeScan) return;
     try {
-      const snapshot = await api<{ id: string }>("/api/snapshots", { method: "POST", body: JSON.stringify({ scanId: activeScan.id, resultIds: results.map((result) => result.id), fieldIds: fields.map((field) => field.id), includeFlagged }) });
+      const snapshot = await api<{ id: string }>("/api/snapshots", { method: "POST", body: JSON.stringify({ scanId: activeScan.id, resultIds: fullTextMode ? [] : results.map((result) => result.id), fieldIds: fullTextMode ? [] : fields.map((field) => field.id), includeFlagged }) });
       const output = await api<{ id: string; outputDir: string; files: Record<string,string>; downloads: Record<string,ExportDownload>; delivery: "direct" | "staging"; verification: Record<string,{ path: string; exists: boolean; size: number }> }>(`/api/snapshots/${snapshot.id}/export`, { method: "POST", body: JSON.stringify({ directoryToken: targetDirectory?.mode === "native" ? targetDirectory.token : "" }) });
       if (targetDirectory?.mode === "native") {
         const checks = Object.values(output.verification);
@@ -1303,18 +1470,18 @@ function ExportsView({ activeScan, results, fields, notify, onError }: { activeS
     <div className="two-col settings-cols">
       <section className="panel export-summary">
         <p className="eyebrow">确认快照</p><h2>{activeScan ? `任务 ${activeScan.id.slice(0,8)}` : "尚未选择任务"}</h2>
-        <div className="export-metrics"><div><strong>{results.length}</strong><span>全部结果</span></div><div><strong>{results.length-unresolved}</strong><span>已确认</span></div><div><strong>{unresolved}</strong><span>待处理</span></div></div>
+        <div className="export-metrics">{fullTextMode ? <><div><strong>{fullTextCount}</strong><span>全文文章</span></div><div><strong>4</strong><span>固定字段</span></div><div><strong>0</strong><span>待审核</span></div></> : <><div><strong>{results.length}</strong><span>全部结果</span></div><div><strong>{results.length-unresolved}</strong><span>已确认</span></div><div><strong>{unresolved}</strong><span>待处理</span></div></>}</div>
         <div className={choosingDirectory ? "export-target choosing" : "export-target"}><div><strong>导出目标文件夹</strong><p aria-live="polite">{choosingDirectory ? "正在等待系统文件夹窗口，请在弹出的窗口中完成选择…" : targetDirectory ? targetDirectory.path : "未选择，将使用应用默认 outputs 目录"}</p></div><button className="ghost small" disabled={choosingDirectory} onClick={() => void chooseDirectory()}>{choosingDirectory ? "等待选择…" : targetDirectory ? "重新选择" : "选择文件夹"}</button></div>
-        {unresolved > 0 && <label className="include-flagged"><input type="checkbox" checked={includeFlagged} onChange={(e) => setIncludeFlagged(e.target.checked)} /><div><strong>将存疑记录一并导出</strong><p>这些记录会保留状态、评分和冲突说明。</p></div></label>}
-        <button className="primary full export-button" disabled={choosingDirectory || !activeScan || !results.length || (unresolved > 0 && !includeFlagged)} onClick={() => void create()}>确认快照并一键导出</button>
+        {!fullTextMode && unresolved > 0 && <label className="include-flagged"><input type="checkbox" checked={includeFlagged} onChange={(e) => setIncludeFlagged(e.target.checked)} /><div><strong>将存疑记录一并导出</strong><p>这些记录会保留状态、评分和冲突说明。</p></div></label>}
+        <button className="primary full export-button" disabled={choosingDirectory || !activeScan || !exportableCount || (!fullTextMode && unresolved > 0 && !includeFlagged)} onClick={() => void create()}>确认快照并一键导出</button>
       </section>
       <section className="panel">
         <PanelHeader title="交付内容" subtitle="同一个快照生成四种一致的文件" />
         <div className="deliverables">
-          <Deliverable icon="X" title="Excel 工作簿" note="选定字段 + 最后一列原始链接" />
-          <Deliverable icon="M" title="Markdown 报告" note="摘要、项目表、冲突与失败说明" />
-          <Deliverable icon="J" title="JSON 数据" note="完整字段、证据、评分和审核历史" />
-          <Deliverable icon="Z" title="网页全文证据包" note="原始 HTML/PDF、清洗正文与哈希" />
+          <Deliverable icon="X" title="Excel 工作簿" note={fullTextMode ? "公众号账号、发布日期、文章标题、正文" : "选定字段 + 最后一列原始链接"} />
+          <Deliverable icon="M" title="Markdown 报告" note={fullTextMode ? "按文章整理的可阅读全文" : "摘要、项目表、冲突与失败说明"} />
+          <Deliverable icon="J" title="JSON 数据" note={fullTextMode ? "仅包含四个指定字段" : "完整字段、证据、评分和审核历史"} />
+          <Deliverable icon="Z" title={fullTextMode ? "文章正文包" : "网页全文证据包"} note={fullTextMode ? "每篇文章一个文本文件" : "原始 HTML/PDF、清洗正文与哈希"} />
         </div>
         {exported && <div className={exported.verified ? "export-result" : "export-result failed"}><strong>{exported.verified ? "导出完成并校验通过" : "未写入所选目标文件夹"}</strong><p>{exported.location}</p>{exported.files.map((value) => <div key={value}><span>文件</span><code>{value}</code></div>)}</div>}
       </section>

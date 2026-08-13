@@ -21,13 +21,14 @@ export interface ModelProviderRecord {
 export interface SearchProviderRecord {
   id: string;
   name: string;
-  kind: "tavily" | "generic-rest" | "mcp";
+  kind: "tavily" | "generic-rest" | "mcp" | "dajiala";
   endpoint: string;
   method: "GET" | "POST";
   headers: Record<string, string>;
   config: JsonObject;
   enabled: boolean;
   hasSecret?: boolean;
+  hasVerifycode?: boolean;
 }
 
 export type RenderBackend = "local" | "lightpanda";
@@ -77,7 +78,7 @@ export interface ScanBudget {
 }
 
 export interface ScanRequest {
-  acquisitionMode?: "web" | "project-intel";
+  acquisitionMode?: "web" | "project-intel" | "wechat";
   startDate: string;
   endDate: string;
   fieldIds: string[];
@@ -85,6 +86,11 @@ export interface ScanRequest {
   providerId?: string;
   modelId?: string;
   searchProviderIds?: string[];
+  wechatProviderId?: string;
+  wechat?: {
+    outputMode: "fulltext" | "projects";
+    maxApiCostCny: number;
+  };
   mcpServerIds?: string[];
   mcpToolNames?: string[];
   budget: ScanBudget;
@@ -97,7 +103,7 @@ export interface ScanRequest {
 
 export type DateStatus = "within_range" | "outside_range" | "date_unknown" | "date_conflict";
 export type ArticleClassification = "project_report" | "non_project" | "uncertain";
-export type DiscoveryMethod = "source" | "sitemap" | "rss" | "archive" | "page-link" | "search" | "mcp";
+export type DiscoveryMethod = "source" | "sitemap" | "rss" | "archive" | "page-link" | "search" | "mcp" | "account-history";
 export type FetchMode = "static" | "browser";
 export type PageType = "article" | "homepage" | "listing" | "roundup" | "document" | "unknown";
 export type ScanStatus = "queued" | "running" | "paused" | "stopping" | "stopped" | "completed" | "failed";
